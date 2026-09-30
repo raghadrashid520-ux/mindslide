@@ -1,9 +1,9 @@
 {
-  "short_name": "Slide Mind",
+  "short_name": "SlideMind AI",
   "name": "SlideMind AI",
   "icons": [
     {
-      "src": "https://raw.githubusercontent.com/raghadrashid520-ux/mindslide/main/favicon_512.png",
+      "src": "favicon_512.png",
       "type": "image/png",
       "sizes": "512x512"
     }
@@ -12,9 +12,11 @@
   "display": "standalone",
   "theme_color": "#ffffff",
   "background_color": "#ffffff",
-  "categories": [
-    "education"
-  ],
-  "description": "تطبيق ذكي متطور مصمم خصيصاً لمساعدة الطلاب على تحليل وتلخيص ملازم ومحاضرات الـ PDF بسرعة وسهولة.",
-  "orientation": "portrait"
+  "description": "\"تطبيق ذكي متطور مصمم خصيصاً لمساعدة الطلاب على تحليل وتلخيص ملازم ومحاضرات الـ PDF بسرعة وسهولة، مع ميزة توليد أسئلة واختبارات تدريبية لتعزيز الفهم والاستعداد للامتحانات بكفاءة عالية.\"",
+  "dir": "auto",
+  "scope": "SlideMind AI",
+  "orientation": "portrait",
+  "display_override": [
+    "window-controls-overlay"
+  ]
 }
