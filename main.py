@@ -21,6 +21,12 @@ st.set_page_config(
 )
 
 
+# حقن ملف الـ Manifest لكي يقرأه موقع PWABuilder
+st.markdown(
+    '<link rel="manifest" href="https://raw.githubusercontent.com/raghadrashid520-ux/mindslide/main/manifest.json">',
+    unsafe_allow_html=True
+)
+
 MODEL_OPTIONS = {
     "Gemini 2.0 Flash — سريع ومتوازن": "gemini-3.5-flash",
     "Gemini 1.5 Flash — اقتصادي للمحاضرات الطويلة": "gemini-1.5-flash",
