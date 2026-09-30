@@ -5,13 +5,13 @@
   "display": "standalone",
   "background_color": "#ffffff",
   "theme_color": "#1e3a8a",
-  "description": "تطبيق ذكي لتحليل وتلخيص ملازم ومحاضرات الـ PDF",
+  "description": "تطبيق ذكي لتحليل وتلخيص ملازم ومحاضرات الـ PDF للطلاب",
   "icons": [
     {
       "src": "https://raw.githubusercontent.com/raghadrashid520-ux/mindslide/main/favicon_512.png",
       "sizes": "512x512",
       "type": "image/png",
-      "purpose": "any maskable"
+      "purpose": "any"
     }
   ]
 }
