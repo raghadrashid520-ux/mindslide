@@ -28,8 +28,8 @@ st.markdown(
 )
 
 MODEL_OPTIONS = {
-    "Gemini 2.0 Flash — سريع ومتوازن": "gemini-3.5-flash",
-    "Gemini 1.5 Flash — اقتصادي للمحاضرات الطويلة": "gemini-1.5-flash",
+    "Gemini 2.0 Flash — سريع ومتوازن": "gemini-3.8-flash",
+    "Gemini 1.5 Flash — اقتصادي للمحاضرات الطويلة": "gemini-3.8-flash",
 }
 
 ANALYSIS_INSTRUCTION = """
