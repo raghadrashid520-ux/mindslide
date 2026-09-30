@@ -19,7 +19,17 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
-
+# كود إخفاء عناصر واجهة Streamlit والفوتر وأيقونات المشاركة
+hide_streamlit_style = """
+<style>
+#MainMenu {visibility: hidden;}
+footer {visibility: hidden;}
+header {visibility: hidden;}
+.stApp > header {visibility: hidden;}
+[data-testid="stToolbar"] {visibility: hidden;}
+</style>
+"""
+st.markdown(hide_streamlit_style, unsafe_allow_html=True)
 
 # حقن ملف الـ Manifest لكي يقرأه موقع PWABuilder
 st.markdown(
