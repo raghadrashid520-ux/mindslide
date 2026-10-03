@@ -1,3 +1,7 @@
-streamlit
+streamlit>=1.40
 google-genai
 pypdf
+python-docx
+fpdf2
+uharfbuzz
+pandas
