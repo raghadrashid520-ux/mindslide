@@ -1,4 +1,3 @@
-
 """SlideMind AI Pro — منصة مذاكرة أكاديمية لطلاب JUST (Streamlit + Gemini).
 
 الإعداد:
@@ -99,6 +98,7 @@ BASE_DELAY = 1.5          # التأخير = BASE_DELAY * 2^attempt + jitter
 PASSES = 2                # عدد مرات المرور على سلسلة النماذج (مع تهدئة بينها)
 TOTAL_BUDGET_S = 110      # أقصى زمن كلي للطلب الواحد
 HTTP_TIMEOUT_MS = 70_000  # مهلة الطلب الواحد (تمنع التعليق عند بطء الشبكة)
+APP_VERSION = "2026-10-04.4"  # يظهر في الشريط الجانبي لتتأكد أي نسخة تعمل على الخادم
 MAX_LECTURE_CHARS = 100_000
 MAX_UPLOAD_MB = 20
 _DEAD_MODELS: set[str] = set()
@@ -2652,15 +2652,26 @@ def _make_page(name: str, fn: Callable[[], None]) -> Callable[[], None]:
     return _page
 
 
+# مفاتيح الأدوات التي تحمل «قيمة» ويجوز إعادة تثبيتها عند التنقل بين الصفحات.
+# الأزرار وأدوات الرفع والجداول المحرَّرة لا تقبل الإسناد عبر session_state (تُسبب StreamlitValueAssignmentNotAllowedError)،
+# لذلك نستخدم قائمة بيضاء صريحة بدل «كل المفاتيح».
+_KEEP_KEYS = frozenset({
+    "lec_level", "code_lang", "code_mode", "code_in", "rd_course", "rd_kind", "rd_n", "rd_style", "rd_text",
+    "gpa_ph", "gpa_pg", "gpa_target", "gpa_next", "plan_text", "plan_passed", "plan_current", "plan_cap",
+    "pomo_focus", "pomo_brk", "pomo_sound", "game_pick", "guess_in", "sup_exam", "sup_mood", "sup_note",
+    "arena_src", "arena_code", "arena_name",
+})
+_KEEP_PREFIXES = ("lecq_a", "rdq_a", "arena_a", "wi_")
+
+
 def _keep_widget_state() -> None:
-    """Streamlit يحذف حالة الأدوات غير المعروضة عند مغادرة الصفحة؛ نعيد تثبيتها كقيم عادية."""
+    """Streamlit يحذف حالة الأدوات غير المعروضة عند مغادرة الصفحة؛ نعيد تثبيت القيم القابلة للإسناد فقط."""
     ss = st.session_state
-    skip = ("_", "gpa_table", "tasks_ed_", "lec_file", "rd_files", "plan_pdf", "tasks_up")
     for k in list(ss.keys()):
-        if isinstance(k, str) and not k.startswith(skip):
+        if isinstance(k, str) and (k in _KEEP_KEYS or k.startswith(_KEEP_PREFIXES)):
             try:
                 ss[k] = ss[k]
-            except Exception:  # أزرار وعناصر لا تقبل الإسناد
+            except Exception:
                 pass
 
 
@@ -2740,6 +2751,7 @@ def main() -> None:
             st.rerun()
         st.markdown("---")
         st.caption("🔒 الملفات تُعالج في الذاكرة فقط ولا تُحفظ على القرص. النتائج للمراجعة وتحتاج تحقق الطالب.")
+        st.caption(f"الإصدار: {APP_VERSION}")
 
     inject_css(bool(ss.dark))
     support_popover()
@@ -2756,4 +2768,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()   
+    main() 
