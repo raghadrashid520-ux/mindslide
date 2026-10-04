@@ -1,3 +1,4 @@
+
 """SlideMind AI Pro — منصة مذاكرة أكاديمية لطلاب JUST (Streamlit + Gemini).
 
 الإعداد:
@@ -13,17 +14,21 @@ import hashlib
 import hmac
 import inspect
 import json
+import math
 import os
 import random
 import re
 import textwrap
 import time
+import struct
 import uuid
+import wave
 import zipfile
 import zlib
 from collections import Counter
 from datetime import date, timedelta
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal
+from functools import lru_cache
 from html import escape
 from io import BytesIO
 from typing import Any, Callable
@@ -210,8 +215,8 @@ def d2(x: Decimal) -> str:
 
 ERROR_MESSAGES = {
     "no_key": "⚙️ لا يوجد مفتاح API صالح للمزوّد المختار. أضف GEMINI_API_KEY أو GROQ_API_KEY في st.secrets أو ملف .env، أو الصق مفتاحك في الشريط الجانبي.",
-    "bad_key": "🔑 رفضت Google مفتاح الخدمة المضبوط على الخادم. المشكلة في إعدادات التطبيق وليست منك؛ يحتاج المدير إلى تحديث المفتاح.",
-    "quota": "⏳ الحصة المجانية لخوادم Gemini مشغولة حالياً (429). جرّبنا كل النماذج البديلة مرتين ولم تتوفر سعة. انتظر دقيقة ثم اضغط «إعادة المحاولة».",
+    "bad_key": "🔑 رفض مزوّد الخدمة المفتاح المضبوط على الخادم. المشكلة في إعدادات التطبيق وليست منك؛ يحتاج المدير إلى تحديث المفتاح.",
+    "quota": "⏳ حصة خدمة الذكاء الاصطناعي المجانية مشغولة حالياً (429). جرّبنا كل النماذج البديلة مرتين ولم تتوفر سعة. انتظر دقيقة ثم اضغط «إعادة المحاولة».",
     "overloaded": "🌐 الخوادم مزدحمة أو الاتصال بطيء. أعدنا المحاولة تدريجياً وجرّبنا نماذج بديلة دون جدوى. بياناتك محفوظة؛ اضغط «إعادة المحاولة».",
     "bad_output": "🧩 أعاد النموذج ناتجاً غير مكتمل ولم نحفظه في الذاكرة المؤقتة. أعد المحاولة.",
     "other": "⚠️ تعذّر إكمال الطلب بسبب خطأ غير متوقع من الخدمة. يمكنك إعادة المحاولة.",
@@ -378,7 +383,7 @@ def call_json(prompt: str, normalize: Callable[[dict[str, Any]], dict[str, Any]]
                         break
                     try:
                         result = normalize(parse_json_strict(text))
-                    except AIUnavailable:
+                    except Exception:  # JSON شاذ أو بنية غير متوقعة
                         last_kind = "bad_output"
                         if attempt < 1:
                             continue
@@ -810,9 +815,9 @@ STATIC_CSS = """
 html, body, [class*="css"], .stApp, button, input, textarea { font-family: 'Cairo', sans-serif !important; }
 html, body { overflow-x: hidden; -webkit-text-size-adjust: 100%; }
 .stApp { background: var(--bg); color: var(--ink); }
-.main .block-container { direction: rtl; max-width: 1200px; padding: 1.4rem 1.6rem 4rem; }
-.main p, .main li, .main label, .main h1, .main h2, .main h3, .main h4, .main span, .main summary { color: var(--ink); overflow-wrap: anywhere; }
-.main .stMarkdown { text-align: right; }
+:is(.main, [data-testid="stMain"]) .block-container, [data-testid="stMainBlockContainer"] { direction: rtl; max-width: 1200px; padding: 1.4rem 1.6rem 4rem; }
+:is(.main, [data-testid="stMain"]) :is(p, li, label, h1, h2, h3, h4, span, summary) { color: var(--ink); overflow-wrap: anywhere; }
+:is(.main, [data-testid="stMain"]) :is(.stMarkdown, [data-testid="stMarkdownContainer"]) { text-align: right; }
 textarea, input { unicode-bidi: plaintext; text-align: start; font-size: 16px !important; }
 pre, code, [data-testid="stCode"], .stCodeBlock { direction: ltr !important; text-align: left !important; max-width: 100%; overflow-x: auto; }
 #MainMenu, footer, [data-testid="stAppDeployButton"], [data-testid="stDecoration"] { visibility: hidden; display: none; }
@@ -844,6 +849,7 @@ pre, code, [data-testid="stCode"], .stCodeBlock { direction: ltr !important; tex
 .pills { display: flex; flex-wrap: wrap; gap: .45rem; margin-top: 1.1rem; }
 .pill { background: rgba(255,255,255,.14); border: 1px solid rgba(255,255,255,.22); border-radius: 99px;
     padding: .28rem .8rem; font-size: .78rem; color: #fff; }
+.hero .pill { color: #fff !important; }
 
 .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: .7rem; margin: .4rem 0 1rem; direction: rtl; }
 .stat { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: .85rem 1rem;
@@ -894,7 +900,7 @@ div.stButton > button, div.stDownloadButton > button { border-radius: 12px; min-
 [data-testid="stPopoverBody"] { direction: rtl; max-width: min(92vw, 420px); }
 
 @media (max-width: 768px) {
-    .main .block-container { padding: .8rem .7rem 3rem; }
+    :is(.main, [data-testid="stMain"]) .block-container, [data-testid="stMainBlockContainer"] { padding: .8rem .7rem 3rem; }
     .hero { padding: 1.3rem 1.05rem; border-radius: 18px; }
     .hero p { line-height: 1.8; font-size: .92rem; }
     .fcard { padding: 1.6rem 1rem; min-height: 160px; }
@@ -953,7 +959,7 @@ def render_quiz(questions: list[dict[str, Any]], prefix: str) -> None:
     if mcq_total:
         st.progress(answered / mcq_total, text=f"أجبت {answered} من {mcq_total} · الصحيح {correct}")
         if st.button("🔁 إعادة الاختبار", key=f"{prefix}_reset"):
-            reset_prefix(f"{prefix}_a")
+            reset_prefix(f"{prefix}_a", f"{prefix}_done")
             st.rerun()
     for i, q in enumerate(questions):
         badge = f" · {q['marks']} علامات" if q.get("marks") else ""
@@ -976,8 +982,9 @@ def render_quiz(questions: list[dict[str, Any]], prefix: str) -> None:
         st.divider()
     if mcq_total and answered == mcq_total:
         pct = round(100 * correct / mcq_total)
-        if pct >= 80:
+        if pct >= 80 and not st.session_state.get(f"{prefix}_done"):
             st.balloons()
+            st.session_state[f"{prefix}_done"] = True
         st.success(f"النتيجة النهائية: {correct}/{mcq_total} ({pct}%)")
 
 
@@ -1287,7 +1294,8 @@ def tab_lecture() -> None:
         uploaded = st.file_uploader("ملف المحاضرة", type=DOC_TYPES, label_visibility="collapsed", key="lec_file")
     with right:
         card("٢ · خيارات الشرح")
-        level = st.select_slider("مستوى الشرح", ["مبسّط", "متوسط", "متقدم"], value="متوسط", key="lec_level")
+        ss.setdefault("lec_level", "متوسط")
+        level = st.select_slider("مستوى الشرح", ["مبسّط", "متوسط", "متقدم"], key="lec_level")
         go = st.button("🚀 ابدأ التحليل", type="primary", disabled=uploaded is None, key="lec_go", **FULL_BTN)
 
     if go and uploaded is not None:
@@ -1414,7 +1422,8 @@ def tab_radar() -> None:
     c1, c2 = st.columns(2)
     course = c1.text_input("اسم المادة", key="rd_course", max_chars=80)
     kind = c2.selectbox("نوع الامتحان", ["Midterm", "Final"], key="rd_kind")
-    n = st.slider("عدد أسئلة الامتحان التجريبي", 5, 25, 12, key="rd_n")
+    ss.setdefault("rd_n", 12)
+    n = st.slider("عدد أسئلة الامتحان التجريبي", 5, 25, key="rd_n")
     style_note = st.text_input("ملاحظات عن أسلوب الدكتور (اختياري)", key="rd_style", max_chars=300)
     pasted = st.text_area("الصق أسئلة الامتحانات السابقة", height=200, key="rd_text")
     files = st.file_uploader("أو ارفع ملفات PDF لامتحانات سابقة", type=DOC_TYPES, accept_multiple_files=True, key="rd_files")
@@ -1460,13 +1469,138 @@ def tab_radar() -> None:
         render_quiz(r["mock_exam"], "rdq")
 
 
+def sd2(x: Decimal) -> str:
+    return ("+" + d2(x)) if x > 0 else d2(x)
+
+
+def whatif_grade_table(valid: list[dict[str, Any]], idx: int, prev_qp: Decimal, sem_h: Decimal, sem_qp: Decimal, tot_h: Decimal) -> list[dict[str, str]]:
+    """أثر تغيير تقدير مادة واحدة على المعدلين الفصلي والتراكمي."""
+    c = valid[idx]
+    h, cur = Decimal(c["h"]), GRADE_POINTS[c["g"]]
+    base = (prev_qp + sem_qp) / tot_h
+    rows = []
+    for g, pts in GRADE_POINTS.items():
+        nq = sem_qp - h * cur + h * pts
+        cum = (prev_qp + nq) / tot_h
+        rows.append({"التقدير": g + (" ← الحالي" if g == c["g"] else ""), "النقاط": d2(pts), "المعدل الفصلي": d2(nq / sem_h),
+                     "المعدل التراكمي": d2(cum), "التغيّر": sd2(cum - base)})
+    return rows
+
+
+def min_grade_for_target(valid: list[dict[str, Any]], idx: int, prev_qp: Decimal, sem_qp: Decimal, tot_h: Decimal, target: Decimal) -> str | None:
+    c = valid[idx]
+    h, cur = Decimal(c["h"]), GRADE_POINTS[c["g"]]
+    for g, pts in sorted(GRADE_POINTS.items(), key=lambda kv: kv[1]):
+        if (prev_qp + sem_qp - h * cur + h * pts) / tot_h >= target:
+            return g
+    return None
+
+
+def project_semesters(cum_qp: Decimal, cum_h: Decimal, y: Decimal, hours: Decimal, n: int) -> list[tuple[int, Decimal, Decimal]]:
+    rows, qp, hh = [], cum_qp, cum_h
+    for k in range(1, n + 1):
+        hh += hours
+        qp += y * hours
+        rows.append((k, hh, qp / hh))
+    return rows
+
+
+def semesters_needed(cum_qp: Decimal, cum_h: Decimal, y: Decimal, hours: Decimal, target: Decimal, cap: int = 40) -> int | None:
+    """أقل عدد فصول بمعدل فصلي ثابت y للوصول إلى الهدف (None = غير ممكن)."""
+    if cum_qp / cum_h >= target:
+        return 0
+    if y <= target:
+        return None
+    n = int(((target * cum_h - cum_qp) / (hours * (y - target))).to_integral_value(rounding=ROUND_CEILING))
+    return n if n <= cap else None
+
+
+def repeat_effect(cum_qp: Decimal, cum_h: Decimal, old: str, new: str, hours: int, replace: bool) -> Decimal:
+    h, op, np_ = Decimal(hours), GRADE_POINTS[old], GRADE_POINTS[new]
+    qp, hh = (cum_qp - op * h + np_ * h, cum_h) if replace else (cum_qp + np_ * h, cum_h + h)
+    return qp / hh if hh else Decimal(0)
+
+
+def gpa_whatif(valid: list[dict[str, Any]], prev_qp: Decimal, sem_h: Decimal, sem_qp: Decimal, tot_h: Decimal) -> None:
+    ss = st.session_state
+    st.markdown("#### 🔮 ماذا لو؟")
+    if not tot_h:
+        st.info("أدخل تقديراتك أو معدلك السابق أولاً لتجرّب السيناريوهات.")
+        return
+    cum_qp, cum_h = prev_qp + sem_qp, tot_h
+    cum = cum_qp / cum_h
+    t1, t2, t3 = st.tabs(["🎓 غيّر علامة", "📈 الفصول القادمة", "🔁 إعادة مادة"])
+    with t1:
+        if not valid or not sem_h:
+            st.info("أضف مواد بتقديراتها في الجدول أعلاه ثم جرّب تغيير علامة إحداها.")
+        else:
+            if ss.get("wi_idx", 0) >= len(valid):
+                ss["wi_idx"] = 0
+            idx = st.selectbox("اختر المادة", list(range(len(valid))), key="wi_idx",
+                               format_func=lambda i: f"{i + 1}. {valid[i]['name'] or 'مادة'} ({valid[i]['h']} س) — {valid[i]['g']}")
+            st.dataframe(pd.DataFrame(whatif_grade_table(valid, idx, prev_qp, sem_h, sem_qp, tot_h)), hide_index=True, **FULL_DF)
+            ss.setdefault("wi_target", 3.0)
+            target = Decimal(str(st.number_input("هدفك للمعدل التراكمي", 0.0, float(MAX_GPA), step=0.05, format="%.2f", key="wi_target")))
+            g = min_grade_for_target(valid, idx, prev_qp, sem_qp, tot_h, target)
+            if g is None:
+                st.error("حتى أعلى تقدير في هذه المادة لا يوصلك لهدفك هذا الفصل؛ تحتاج فصولاً إضافية (انظر تبويب «الفصول القادمة»).")
+            elif g == "F":
+                st.success("أي تقدير في هذه المادة يُبقيك عند هدفك أو فوقه (مع بقاء بقية علاماتك كما هي).")
+            else:
+                st.success(f"أقل تقدير تحتاجه في هذه المادة لتبلغ {d2(target)} هو **{g}** (مع بقاء بقية علاماتك كما هي).")
+    with t2:
+        ss.setdefault("wi_y", 3.5)
+        ss.setdefault("wi_h", 15)
+        ss.setdefault("wi_n", 4)
+        ss.setdefault("wi_target2", 3.5)
+        a, b = st.columns(2)
+        y = Decimal(str(a.number_input("معدلك الفصلي المتوقع", 0.5, float(MAX_GPA), step=0.05, format="%.2f", key="wi_y")))
+        hrs = Decimal(int(b.number_input("ساعات كل فصل", 1, 30, step=1, key="wi_h")))
+        n = st.slider("عدد الفصول القادمة", 1, 10, key="wi_n")
+        rows = project_semesters(cum_qp, cum_h, y, hrs, n)
+        st.dataframe(pd.DataFrame([{"الفصل": f"+{k}", "الساعات التراكمية": int(hh), "المعدل التراكمي": d2(c)} for k, hh, c in rows]),
+                     hide_index=True, **FULL_DF)
+        st.line_chart(pd.DataFrame({"المعدل التراكمي": [float(c) for _, _, c in rows]}, index=[f"+{k}" for k, _, _ in rows]))
+        target2 = Decimal(str(st.number_input("الهدف المطلوب", 0.0, float(MAX_GPA), step=0.05, format="%.2f", key="wi_target2")))
+        need = semesters_needed(cum_qp, cum_h, y, hrs, target2)
+        if need == 0:
+            st.success("معدلك الحالي يحقق هدفك بالفعل.")
+        elif need is None:
+            st.error("بهذا المعدل الفصلي المتوقع لا تصل للهدف (يجب أن يكون المعدل الفصلي أعلى من الهدف).")
+        else:
+            st.success(f"تحتاج ≈ **{need}** فصلاً بمعدل {d2(y)} و{int(hrs)} ساعة للفصل لتبلغ {d2(target2)}.")
+        st.caption("تقدير رياضي بافتراض معدل فصلي وعدد ساعات ثابتين؛ الواقع يتغير.")
+    with t3:
+        ss.setdefault("wi_old", "D")
+        ss.setdefault("wi_new", "B")
+        ss.setdefault("wi_rh", 3)
+        grades = list(GRADE_POINTS)
+        a, b, c = st.columns(3)
+        old = a.selectbox("العلامة القديمة", grades, key="wi_old")
+        new = b.selectbox("العلامة الجديدة", grades, key="wi_new")
+        rh = int(c.number_input("ساعات المادة", 1, 6, step=1, key="wi_rh"))
+        mode = st.radio("طريقة الاحتساب", ["تُستبدل القديمة بالجديدة", "تُحتسب العلامتان معاً"], key="wi_policy")
+        replace = mode.startswith("تُستبدل")
+        if replace and rh > cum_h:
+            st.error("ساعات المادة أكبر من مجموع ساعاتك المسجّلة.")
+        else:
+            after = repeat_effect(cum_qp, cum_h, old, new, rh, replace)
+            m1, m2 = st.columns(2)
+            m1.metric("معدلك الآن", d2(cum))
+            m2.metric("بعد إعادة المادة", d2(after), delta=sd2(after - cum))
+        st.caption("⚠️ سياسة الإعادة (استبدال العلامة أو احتساب الاثنتين أو سقف للعلامة الجديدة) تختلف بين الجامعات والأنظمة؛ تأكد من لائحة جامعتك. "
+                   "الحساب يفترض أن العلامة القديمة محتسبة أصلاً ضمن معدلك وساعاتك السابقة.")
+
+
 def tab_gpa() -> None:
     ss = st.session_state
     card("حاسبة المعدل الفصلي والتراكمي (JUST)",
          f"المعدل على مقياس {d2(MAX_GPA)}. نقاط المساق = نقاط التقدير × الساعات. الحساب بأرقام عشرية دقيقة والتقريب لمنزلتين عند العرض فقط.")
     p1, p2 = st.columns(2)
-    prev_h = p1.number_input("الساعات المقطوعة سابقاً", 0, 250, 0, 1, key="gpa_ph")
-    prev_gpa = p2.number_input("المعدل التراكمي السابق", 0.0, float(MAX_GPA), 0.0, 0.01, format="%.2f", key="gpa_pg")
+    ss.setdefault("gpa_ph", 0)
+    ss.setdefault("gpa_pg", 0.0)
+    prev_h = p1.number_input("الساعات المقطوعة سابقاً", 0, 250, step=1, key="gpa_ph")
+    prev_gpa = p2.number_input("المعدل التراكمي السابق", 0.0, float(MAX_GPA), step=0.01, format="%.2f", key="gpa_pg")
 
     default_df = pd.DataFrame({"المادة": [""] * 6, "الساعات": [3] * 6, "التقدير": [None] * 6})
     if ss.pop("_fresh_gpa", False) or "gpa_base" not in ss:
@@ -1480,13 +1614,14 @@ def tab_gpa() -> None:
         },
     )
     ss.gpa_latest = edited
-    sem_h, sem_qp = Decimal(0), Decimal(0)
+    sem_h, sem_qp, valid = Decimal(0), Decimal(0), []
     for _, row in edited.iterrows():
         pts = GRADE_POINTS.get(row["التقدير"]) if isinstance(row["التقدير"], str) else None
         h = pd.to_numeric(row["الساعات"], errors="coerce")
         if pts is not None and pd.notna(h) and h > 0:
             sem_h += Decimal(int(h))
             sem_qp += Decimal(int(h)) * pts
+            valid.append({"name": str(row["المادة"] or "")[:40], "h": int(h), "g": row["التقدير"]})
     sem_gpa = sem_qp / sem_h if sem_h else Decimal(0)
     prev_qp = Decimal(int(prev_h)) * Decimal(str(round(prev_gpa, 2)))
     tot_h = Decimal(int(prev_h)) + sem_h
@@ -1504,9 +1639,13 @@ def tab_gpa() -> None:
     if tot_h and cum_gpa < Decimal("2.00"):
         st.warning("المعدل التراكمي أقل من 2.00؛ راجع لوائح الإنذار الأكاديمي في الجامعة.")
 
+    gpa_whatif(valid, prev_qp, sem_h, sem_qp, tot_h)
+
     with st.expander("🎯 مخطط الهدف: كم أحتاج الفصل القادم؟"):
-        target = Decimal(str(st.number_input("المعدل التراكمي المستهدف", 0.0, float(MAX_GPA), 3.5, 0.05, format="%.2f", key="gpa_target")))
-        nxt = int(st.number_input("ساعات الفصل القادم", 1, 30, 15, 1, key="gpa_next"))
+        ss.setdefault("gpa_target", 3.5)
+        ss.setdefault("gpa_next", 15)
+        target = Decimal(str(st.number_input("المعدل التراكمي المستهدف", 0.0, float(MAX_GPA), step=0.05, format="%.2f", key="gpa_target")))
+        nxt = int(st.number_input("ساعات الفصل القادم", 1, 30, step=1, key="gpa_next"))
         need = (target * (tot_h + nxt) - cum_gpa * tot_h) / Decimal(nxt)
         if need > MAX_GPA:
             st.error(f"المطلوب فصلياً {d2(need)} وهو أعلى من الحد الأقصى {d2(MAX_GPA)}؛ الهدف يتطلب أكثر من فصل.")
@@ -1564,7 +1703,8 @@ def tab_plan() -> None:
                ("متاحة الآن", sum(s == "available" for s in status.values())), ("مقفلة", sum(s == "locked" for s in status.values()))])
 
     st.markdown("#### 🗓️ الجدول الإرشادي المقترح للفصل القادم")
-    cap = st.slider("الحد الأعلى لساعات الفصل القادم", 9, 21, 15, key="plan_cap")
+    ss.setdefault("plan_cap", 15)
+    cap = st.slider("الحد الأعلى لساعات الفصل القادم", 9, 21, key="plan_cap")
     chosen, skipped = recommend_semester(courses, done, cap)
     if not chosen:
         st.info("لا توجد مواد يمكن تسجيلها حالياً وفق المتطلبات." if len(done) < len(courses) else "🎉 أنهيت كل مواد الخطة.")
@@ -1688,7 +1828,8 @@ def tab_arena() -> None:
                     st.warning("الرمز طويل وقد لا تقبله بعض التطبيقات؛ قلّل عدد الأسئلة.")
     with t_join:
         qp = st.query_params.get("arena")
-        incoming = st.text_input("رمز التحدي", value=qp or "", key="arena_code", max_chars=60000)
+        ss.setdefault("arena_code", qp or "")
+        incoming = st.text_input("رمز التحدي", key="arena_code", max_chars=60000)
         decoded = decode_arena(incoming) if incoming else None
         if incoming and not decoded:
             st.error("الرمز غير صالح أو تالف.")
@@ -1965,6 +2106,27 @@ POMO_MAX_FOCUS, POMO_MAX_BREAK = 50, 10
 GAME_EMOJIS = ["📚", "✏️", "🧠", "💡", "🎓", "🔬"]
 
 
+@lru_cache(maxsize=4)
+def make_chime(kind: str) -> bytes:
+    """نغمة تنبيه WAV تُولَّد برمجياً (لا ملفات خارجية): ثلاث نغمات صاعدة لانتهاء التركيز، ونغمتان لانتهاء الاستراحة."""
+    freqs = (523.25, 659.25, 783.99, 1046.5) if kind == "focus" else (783.99, 587.33)
+    rate, note = 22050, 0.32
+    frames = bytearray()
+    for f in freqs:
+        for i in range(int(rate * note)):
+            t = i / rate
+            env = math.exp(-4.5 * t / note) * min(1.0, i / 180)
+            v = 0.55 * env * (math.sin(2 * math.pi * f * t) + 0.3 * math.sin(4 * math.pi * f * t)) / 1.3
+            frames += struct.pack("<h", int(v * 32767))
+    buf = BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(bytes(frames))
+    return buf.getvalue()
+
+
 def _pomo() -> dict[str, Any]:
     ss = st.session_state
     if "pomo" not in ss:
@@ -2024,10 +2186,10 @@ def _pomo_clock() -> None:
     st.progress(min(1.0, max(0.0, 1 - left / total)) if total else 1.0)
     if left <= 0:
         if focus:
-            p.update(state="focus_done", done=p["done"] + 1, minutes=p["minutes"] + p["focus"], reward=True)
+            p.update(state="focus_done", done=p["done"] + 1, minutes=p["minutes"] + p["focus"], reward=True, chime="focus")
             st.toast("🎉 أنهيت جلسة التركيز! مكافأتك جاهزة")
         else:
-            p.update(state="idle")
+            p.update(state="idle", chime="break")
             st.toast("☕ انتهت الاستراحة")
         _pomo_sync()
         st.rerun()
@@ -2097,7 +2259,8 @@ def guess_game() -> None:
         _guess_new()
     g = ss.guess
     st.write("فكّرتُ في رقم بين **1 و100**. لديك 7 محاولات!")
-    st.number_input("تخمينك", 1, 100, 50, 1, key="guess_in", disabled=g["won"] or g["tries"] >= g["max"])
+    ss.setdefault("guess_in", 50)
+    st.number_input("تخمينك", 1, 100, step=1, key="guess_in", disabled=g["won"] or g["tries"] >= g["max"])
     st.button("🎯 خمّن", key="guess_go", on_click=_guess_try, type="primary", disabled=g["won"] or g["tries"] >= g["max"])
     if g["hint"]:
         (st.success if g["won"] else st.info)(g["hint"])
@@ -2113,10 +2276,22 @@ def tab_pomodoro() -> None:
     card("⏱️ مؤقت بومودورو الدراسي", f"ركّز حتى {POMO_MAX_FOCUS} دقيقة ثم استرح حتى {POMO_MAX_BREAK} دقائق. عند إنهاء جلسة التركيز بنجاح تنال لعبة مصغرة مكافأةً لك 🎮")
     running = p["state"] in ("focus", "break")
     c1, c2 = st.columns(2)
-    c1.slider("مدة جلسة الدراسة (دقيقة)", 5, POMO_MAX_FOCUS, 25, 1, key="pomo_focus", disabled=running)
-    c2.slider("مدة الاستراحة (دقيقة)", 1, POMO_MAX_BREAK, 5, 1, key="pomo_brk", disabled=running)
+    ss.setdefault("pomo_focus", 25)
+    ss.setdefault("pomo_brk", 5)
+    c1.slider("مدة جلسة الدراسة (دقيقة)", 5, POMO_MAX_FOCUS, step=1, key="pomo_focus", disabled=running)
+    c2.slider("مدة الاستراحة (دقيقة)", 1, POMO_MAX_BREAK, step=1, key="pomo_brk", disabled=running)
     stat_grid([("جلسات مكتملة", p["done"]), ("دقائق تركيز", p["minutes"]),
                ("الحالة", {"idle": "جاهز", "focus": "تركيز", "break": "استراحة", "focus_done": "أحسنت!"}[p["state"]])])
+
+    ss.setdefault("pomo_sound", True)
+    sc1, sc2 = st.columns([2, 1])
+    sc1.toggle("🔔 صوت تنبيه عند انتهاء الجلسة والاستراحة", key="pomo_sound")
+    sc2.button("🔊 جرّب الصوت", key="pomo_test_sound", on_click=lambda: p.update(chime="test"), **FULL_BTN)
+    kind = p.pop("chime", None)
+    if kind and (kind == "test" or ss.get("pomo_sound")):
+        st.audio(make_chime("focus" if kind == "test" else kind), format="audio/wav", autoplay=True)
+        if kind == "test":
+            st.caption("إن لم تسمع شيئاً: ارفع صوت الهاتف، وبعض المتصفحات تمنع التشغيل التلقائي حتى تنقر على الصفحة.")
 
     if p["state"] == "idle":
         st.button("▶️ ابدأ جلسة دراسة", key="pomo_go", on_click=_pomo_start_focus, type="primary", **FULL_BTN)
@@ -2182,7 +2357,7 @@ PBKDF2_ITERS = 310_000
 MAX_FAILS, LOCK_SECONDS = 5, 300
 _EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,190}\.[^@\s]{2,}$")
 SIMPLE_KEYS = ["dark", "provider_pref", "gpa_ph", "gpa_pg", "gpa_target", "gpa_next", "plan_text", "plan_passed", "plan_current",
-               "plan_cap", "pomo_focus", "pomo_brk", "sup_mood"]
+               "plan_cap", "pomo_focus", "pomo_brk", "sup_mood", "pomo_sound"]
 _RANGES = {"gpa_ph": (0, 250, int), "gpa_pg": (0.0, float(MAX_GPA), float), "gpa_target": (0.0, float(MAX_GPA), float),
            "gpa_next": (1, 30, int), "plan_cap": (9, 21, int), "pomo_focus": (5, 50, int), "pomo_brk": (1, 10, int)}
 _LECTURE_KEYS = {"title", "overview", "summary_sections", "key_takeaways", "teacher_explanations", "flashcards", "mind_map", "quiz", "study_tips"}
@@ -2232,7 +2407,7 @@ def db_register(email: str, pw: str) -> tuple[str | None, str]:
     uid, salt = uuid.uuid4().hex, os.urandom(16).hex()
     try:
         with get_engine().begin() as c:
-            if c.execute(text("SELECT 1 FROM users WHERE email=:e"), {"e": email}).fetchone():
+            if c.execute(text("SELECT id FROM users WHERE email=:e"), {"e": email}).fetchone():
                 return None, "هذا البريد مسجّل مسبقاً؛ سجّل الدخول بدلاً من ذلك."
             c.execute(text("INSERT INTO users (id,email,salt,pw_hash,iters,fails,locked_until,created) VALUES (:i,:e,:s,:h,:n,0,0,:t)"),
                       {"i": uid, "e": email, "s": salt, "h": _pw_hash(pw, salt, PBKDF2_ITERS), "n": PBKDF2_ITERS, "t": int(time.time())})
@@ -2342,6 +2517,8 @@ def apply_user_data(data: dict[str, Any]) -> None:
         ss["provider_pref"] = data["provider_pref"]
     if data.get("sup_mood") in MOOD_ADVICE:
         ss["sup_mood"] = data["sup_mood"]
+    if isinstance(data.get("pomo_sound"), bool):
+        ss["pomo_sound"] = data["pomo_sound"]
     if isinstance(data.get("plan_text"), str) and data["plan_text"].strip():
         ss["plan_text"] = data["plan_text"][:20000]
     for k in ("plan_passed", "plan_current"):
@@ -2536,11 +2713,12 @@ def main() -> None:
         st.markdown("### ◈ SlideMind AI")
         account_sidebar()
         st.markdown("---")
-        ss.dark = st.toggle("🌙 الوضع الداكن", value=ss.dark, key="dark_toggle")
+        ss.setdefault("dark_toggle", ss.dark)
+        ss.dark = st.toggle("🌙 الوضع الداكن", key="dark_toggle")
         st.markdown("---")
         env_pref = os.getenv("AI_PROVIDER", "auto")
-        st.selectbox("🔌 مزوّد الذكاء الاصطناعي", list(PROVIDER_LABELS), format_func=PROVIDER_LABELS.get,
-                     index=list(PROVIDER_LABELS).index(env_pref) if env_pref in PROVIDER_LABELS else 0, key="provider_pref")
+        ss.setdefault("provider_pref", env_pref if env_pref in PROVIDER_LABELS else "auto")
+        st.selectbox("🔌 مزوّد الذكاء الاصطناعي", list(PROVIDER_LABELS), format_func=PROVIDER_LABELS.get, key="provider_pref")
         with st.expander("🔑 مفاتيحي الخاصة (اختياري)"):
             st.caption("تُحفظ في ذاكرة جلستك فقط ولا تُكتب على القرص.")
             st.text_input("Gemini API Key", type="password", key="user_GEMINI_API_KEY")
@@ -2578,4 +2756,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main()   
