@@ -11,13 +11,18 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
+import inspect
 import json
 import os
 import random
 import re
 import textwrap
 import time
+import uuid
+import zipfile
 import zlib
+from collections import Counter
 from datetime import date, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from html import escape
@@ -25,6 +30,7 @@ from io import BytesIO
 from typing import Any, Callable
 
 import pandas as pd
+import requests
 import streamlit as st
 from google import genai
 from google.genai import errors as genai_errors
@@ -53,7 +59,29 @@ except Exception:  # pragma: no cover
     HAS_PDF = False
 
 
+try:  # دعم ملف .env
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except Exception:  # pragma: no cover
+    pass
+
 st.set_page_config(page_title="SlideMind AI", page_icon="◈", layout="wide", initial_sidebar_state="auto")
+
+def _stretch(fn: Any) -> dict[str, Any]:
+    """يختار معامل التمدد الصحيح لإصدار Streamlit المثبّت (width='stretch' الحديث أو use_container_width القديم)."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return {}
+    w = params.get("width")
+    if w is not None and w.default in ("stretch", "content"):
+        return {"width": "stretch"}
+    return {"use_container_width": True} if "use_container_width" in params else {}
+
+
+FULL_BTN, FULL_DL = _stretch(st.button), _stretch(st.download_button)
+FULL_DF, FULL_ED, FULL_GV = _stretch(st.dataframe), _stretch(st.data_editor), _stretch(st.graphviz_chart)
 
 # ════════════════════════════════════════════════════════════════════════
 # 1) الإعدادات الثابتة
@@ -68,7 +96,7 @@ PASSES = 2                # عدد مرات المرور على سلسلة ال�
 TOTAL_BUDGET_S = 110      # أقصى زمن كلي للطلب الواحد
 HTTP_TIMEOUT_MS = 70_000  # مهلة الطلب الواحد (تمنع التعليق عند بطء الشبكة)
 MAX_LECTURE_CHARS = 100_000
-MAX_UPLOAD_MB = 25
+MAX_UPLOAD_MB = 20
 _DEAD_MODELS: set[str] = set()
 _SIMPLE_CFG: set[str] = set()  # نماذج 3.x رفضت إعداد التفكير فنستخدم إعداداً مبسطاً
 
@@ -182,7 +210,7 @@ def d2(x: Decimal) -> str:
 # ════════════════════════════════════════════════════════════════════════
 
 ERROR_MESSAGES = {
-    "no_key": "⚙️ الخدمة غير مهيأة: لم يتم العثور على GEMINI_API_KEY في إعدادات التطبيق (st.secrets). هذه مسألة إعداد لدى مدير التطبيق.",
+    "no_key": "⚙️ لا يوجد مفتاح API صالح للمزوّد المختار. أضف GEMINI_API_KEY أو GROQ_API_KEY في st.secrets أو ملف .env، أو الصق مفتاحك في الشريط الجانبي.",
     "bad_key": "🔑 رفضت Google مفتاح الخدمة المضبوط على الخادم. المشكلة في إعدادات التطبيق وليست منك؛ يحتاج المدير إلى تحديث المفتاح.",
     "quota": "⏳ الحصة المجانية لخوادم Gemini مشغولة حالياً (429). جرّبنا كل النماذج البديلة مرتين ولم تتوفر سعة. انتظر دقيقة ثم اضغط «إعادة المحاولة».",
     "overloaded": "🌐 الخوادم مزدحمة أو الاتصال بطيء. أعدنا المحاولة تدريجياً وجرّبنا نماذج بديلة دون جدوى. بياناتك محفوظة؛ اضغط «إعادة المحاولة».",
@@ -214,54 +242,138 @@ def parse_json_strict(raw: str) -> dict[str, Any]:
     raise AIUnavailable("bad_output", "json parse")
 
 
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_CHAIN = ["llama-3.3-70b-versatile", "openai/gpt-oss-120b", "llama-3.1-8b-instant", "openai/gpt-oss-20b"]
+GROQ_MAX_PROMPT_CHARS = int(os.getenv("GROQ_MAX_PROMPT_CHARS", "24000"))  # حدّ آمن لحصص Groq (TPM)
+KEY_NAMES = {"gemini": "GEMINI_API_KEY", "groq": "GROQ_API_KEY"}
+PROVIDER_LABELS = {
+    "auto": "تلقائي: Gemini ثم Groq",
+    "groq_first": "Groq أولاً (أسرع) ثم Gemini",
+    "gemini": "Gemini فقط",
+    "groq": "Groq فقط",
+}
+_GROQ_NO_JSON: set[str] = set()
+
+
+class ProviderError(Exception):
+    def __init__(self, code: int | None, detail: str = "", retry_after: float | None = None) -> None:
+        super().__init__(detail)
+        self.code, self.detail, self.retry_after = code, detail.lower(), retry_after
+
+
+def get_key(name: str) -> str:
+    """الأولوية: مفتاح الطالب في الجلسة ← st.secrets ← متغيرات البيئة/.env"""
+    v = st.session_state.get(f"user_{name}")
+    if not v:
+        try:
+            v = st.secrets[name]
+        except Exception:
+            v = os.getenv(name, "")
+    return str(v or "").strip()
+
+
+def provider_plan() -> list[tuple[str, str]]:
+    pref = st.session_state.get("provider_pref") or os.getenv("AI_PROVIDER", "auto")
+    order = {"auto": ["gemini", "groq"], "groq_first": ["groq", "gemini"], "gemini": ["gemini"], "groq": ["groq"]}.get(pref, ["gemini", "groq"])
+    env_models = lambda n, d: [m.strip() for m in os.getenv(n, "").split(",") if m.strip()] or d  # noqa: E731
+    chains = {"gemini": env_models("GEMINI_MODELS", MODEL_CHAIN), "groq": env_models("GROQ_MODELS", GROQ_CHAIN)}
+    return [(p, m) for p in order if get_key(KEY_NAMES[p]) for m in chains[p]]
+
+
 def _make_config(model: str, max_tokens: int) -> types.GenerateContentConfig:
     is3 = model.startswith("gemini-3")
     kwargs: dict[str, Any] = dict(
         system_instruction=SYSTEM_RULES, response_mime_type="application/json",
-        max_output_tokens=max(max_tokens, 32000) if is3 else max_tokens,  # التفكير يُحتسب ضمن سقف المخرجات
+        max_output_tokens=max(max_tokens, 32000) if is3 else max_tokens,
     )
     if not is3:
-        kwargs["temperature"] = 0.3  # Google لا توصي بضبطها في سلسلة Gemini 3
+        kwargs["temperature"] = 0.3
     if "2.5" in model:
         kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
     elif is3 and model not in _SIMPLE_CFG:
         try:
-            kwargs["thinking_config"] = types.ThinkingConfig(thinking_level="LOW")  # تفكير خفيف = أسرع وأقل استهلاكاً
+            kwargs["thinking_config"] = types.ThinkingConfig(thinking_level="LOW")
         except Exception:
             pass
     return types.GenerateContentConfig(**kwargs)
 
 
-def _backoff(attempt: int, deadline: float) -> bool:
-    delay = min(BASE_DELAY * (2 ** attempt) + random.random(), 15)
+def _gen_gemini(key: str, model: str, prompt: str, max_tokens: int) -> str:
+    try:
+        client = genai.Client(api_key=key, http_options=types.HttpOptions(timeout=HTTP_TIMEOUT_MS))
+        r = client.models.generate_content(model=model, contents=prompt, config=_make_config(model, max_tokens))
+        return (r.text or "").strip()
+    except genai_errors.APIError as exc:
+        raise ProviderError(getattr(exc, "code", None), str(exc)) from exc
+    except Exception as exc:  # شبكة/مهلة
+        raise ProviderError(None, str(exc)) from exc
+
+
+def _gen_groq(key: str, model: str, prompt: str, max_tokens: int) -> str:
+    body: dict[str, Any] = {
+        "model": model, "temperature": 0.3, "max_tokens": min(max_tokens, 8000),
+        "messages": [{"role": "system", "content": SYSTEM_RULES}, {"role": "user", "content": prompt}],
+    }
+    if model not in _GROQ_NO_JSON:
+        body["response_format"] = {"type": "json_object"}
+    try:
+        r = requests.post(GROQ_URL, headers={"Authorization": f"Bearer {key}"}, json=body, timeout=HTTP_TIMEOUT_MS / 1000)
+    except requests.RequestException as exc:
+        raise ProviderError(None, str(exc)) from exc
+    if r.status_code != 200:
+        try:
+            ra = float(r.headers.get("retry-after"))
+        except (TypeError, ValueError):
+            ra = None
+        raise ProviderError(r.status_code, r.text[:400], ra)
+    try:
+        return (r.json()["choices"][0]["message"]["content"] or "").strip()
+    except Exception as exc:
+        raise ProviderError(None, "bad response body") from exc
+
+
+def _shrink(prompt: str, limit: int) -> str:
+    if len(prompt) <= limit:
+        return prompt
+    head = int(limit * 0.65)
+    return prompt[:head] + "\n[... اختُصر الجزء الأوسط لتجاوز حد الطلب ...]\n" + prompt[-(limit - head):]
+
+
+def _sleep(delay: float, deadline: float) -> bool:
+    delay = min(delay, 15)
     if time.monotonic() + delay > deadline:
         return False
     time.sleep(delay)
     return True
 
 
+def _backoff(attempt: int, deadline: float) -> bool:
+    return _sleep(BASE_DELAY * (2 ** attempt) + random.random(), deadline)
+
+
 def call_json(prompt: str, normalize: Callable[[dict[str, Any]], dict[str, Any]], max_tokens: int = 16000) -> dict[str, Any]:
-    """يستدعي Gemini ويعيد نتيجة مطبَّعة وصالحة. التحقق من JSON يتم داخل حلقة المحاولات،
-    فالرد المقطوع يُعاد توليده أو ينتقل لنموذج آخر بدل أن يفشل الطلب."""
-    key = get_api_key()
-    if not key:
+    """يجرّب (مزوّد، نموذج) بالترتيب مع Backoff، ويتحقق من JSON داخل الحلقة؛ يعيد نتيجة صالحة أو يرفع AIUnavailable."""
+    plan = provider_plan()
+    if not plan:
         raise AIUnavailable("no_key")
-    client = genai.Client(api_key=key, http_options=types.HttpOptions(timeout=HTTP_TIMEOUT_MS))
     deadline = time.monotonic() + TOTAL_BUDGET_S
-    last_kind = "other"
+    last_kind, groq_limit, bad_keys = "other", GROQ_MAX_PROMPT_CHARS, set()
     for pass_no in range(PASSES):
-        if pass_no and not _backoff(3, deadline):  # فترة تهدئة قبل المرور الثاني
+        if pass_no and not _backoff(3, deadline):
             break
-        for model in MODEL_CHAIN:
-            if model in _DEAD_MODELS:
+        for provider, model in plan:
+            mid = f"{provider}:{model}"
+            if mid in _DEAD_MODELS or provider in bad_keys:
                 continue
             if time.monotonic() > deadline:
                 break
-            config = _make_config(model, max_tokens)
+            key = get_key(KEY_NAMES[provider])
             for attempt in range(MAX_RETRIES + 1):
                 try:
-                    response = client.models.generate_content(model=model, contents=prompt, config=config)
-                    text = (response.text or "").strip()
+                    if provider == "groq":
+                        text = _gen_groq(key, model, _shrink(prompt, groq_limit), max_tokens)
+                    else:
+                        text = _gen_gemini(key, model, prompt, max_tokens)
                     if not text:
                         last_kind = "bad_output"
                         break
@@ -270,39 +382,40 @@ def call_json(prompt: str, normalize: Callable[[dict[str, Any]], dict[str, Any]]
                     except AIUnavailable:
                         last_kind = "bad_output"
                         if attempt < 1:
-                            continue  # إعادة توليد مرة واحدة على النموذج نفسه
+                            continue
                         break
-                    result["_model"] = model
+                    result["_model"] = f"{provider}/{model}"
                     return result
-                except genai_errors.APIError as exc:
-                    code = getattr(exc, "code", None)
-                    detail = str(exc).lower()
-                    if code == 404:
-                        _DEAD_MODELS.add(model)  # نموذج متوقف: لا نكرر الطلب إليه
+                except ProviderError as e:
+                    code, d = e.code, e.detail
+                    if code == 404 or (code == 400 and "model" in d and any(t in d for t in ("not found", "decommissioned", "does not exist", "not supported"))):
+                        _DEAD_MODELS.add(mid)
                         last_kind = "other"
                         break
-                    if code in (401, 403) or (code == 400 and "api key" in detail):
-                        raise AIUnavailable("bad_key", detail[:120])
+                    if code in (401, 403) or (code == 400 and "api key" in d):
+                        bad_keys.add(provider)
+                        last_kind = "bad_key"
+                        break
+                    if provider == "groq" and (code == 413 or any(t in d for t in ("too large", "reduce your", "context length"))) and groq_limit > 4000:
+                        groq_limit = int(groq_limit * 0.6)  # اختصر النص ثم أعد المحاولة
+                        continue
+                    if code == 400 and provider == "groq" and model not in _GROQ_NO_JSON and ("json" in d or "response_format" in d):
+                        _GROQ_NO_JSON.add(model)
+                        continue
+                    if code == 400 and provider == "gemini" and model.startswith("gemini-3") and model not in _SIMPLE_CFG:
+                        _SIMPLE_CFG.add(model)
+                        continue
                     if code == 429:
                         last_kind = "quota"
-                        if attempt < 1 and _backoff(attempt, deadline):
-                            continue  # حصة الدقيقة قد تتحرر سريعاً؛ بعدها نجرب نموذجاً آخر
+                        if attempt < 1 and _sleep(e.retry_after or (BASE_DELAY * 2 + random.random()), deadline) and (e.retry_after or 0) <= 15:
+                            continue
                         break
-                    if code in (500, 502, 503, 504):
+                    if code is None or code in (500, 502, 503, 504):
                         last_kind = "overloaded"
                         if attempt < MAX_RETRIES and _backoff(attempt, deadline):
                             continue
                         break
-                    if code == 400 and model.startswith("gemini-3") and model not in _SIMPLE_CFG:
-                        _SIMPLE_CFG.add(model)
-                        config = _make_config(model, max_tokens)
-                        continue
                     last_kind = "other"
-                    break
-                except Exception:  # شبكة/مهلة
-                    last_kind = "overloaded"
-                    if attempt < MAX_RETRIES and _backoff(attempt, deadline):
-                        continue
                     break
     raise AIUnavailable(last_kind)
 
@@ -454,26 +567,134 @@ def normalize_plan(d: dict[str, Any]) -> dict[str, Any]:
 # ════════════════════════════════════════════════════════════════════════
 
 
-@st.cache_data(show_spinner=False, max_entries=16)
-def process_pdf(file_bytes: bytes, min_chars: int = 200) -> dict[str, Any]:
+DOC_TYPES = ["pdf", "docx", "pptx", "xlsx", "txt"]
+_MAX_UNZIPPED = 250 * 1024 * 1024
+
+
+def _check_zip(data: bytes) -> None:
     try:
-        reader = PdfReader(BytesIO(file_bytes))
-        if reader.is_encrypted and not reader.decrypt(""):
-            raise ValueError("الملف محمي بكلمة مرور. أزل الحماية ثم أعد الرفع.")
-        pages = []
-        for n, page in enumerate(reader.pages, start=1):
-            t = (page.extract_text() or "").strip()
+        with zipfile.ZipFile(BytesIO(data)) as z:
+            if sum(i.file_size for i in z.infolist()) > _MAX_UNZIPPED:
+                raise ValueError("حجم الملف بعد فك الضغط كبير جداً.")
+    except zipfile.BadZipFile as exc:
+        raise ValueError("الملف تالف أو ليس بصيغة Office سليمة (الصيغ القديمة doc/ppt/xls احفظها بصيغة حديثة أولاً).") from exc
+
+
+def _read_pdf(data: bytes) -> tuple[str, str, int]:
+    reader = PdfReader(BytesIO(data))
+    if reader.is_encrypted and not reader.decrypt(""):
+        raise ValueError("الملف محمي بكلمة مرور. أزل الحماية ثم أعد الرفع.")
+    pages = []
+    for n, page in enumerate(reader.pages, start=1):
+        t = (page.extract_text() or "").strip()
+        if t:
+            pages.append(f"--- الصفحة {n} ---\n{t}")
+    return "\n\n".join(pages), "الصفحات", len(reader.pages)
+
+
+def _read_docx(data: bytes) -> tuple[str, str, int]:
+    if not HAS_DOCX:
+        raise ValueError("ثبّت المكتبة python-docx لقراءة ملفات Word.")
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    doc = Document(BytesIO(data))
+    parts: list[str] = []
+    for child in doc.element.body.iterchildren():  # بترتيب ظهورها في المستند
+        if child.tag.endswith("}p"):
+            t = Paragraph(child, doc).text.strip()
             if t:
-                pages.append(f"--- الصفحة {n} ---\n{t}")
-        text = "\n\n".join(pages)
-        total = len(reader.pages)
+                parts.append(t)
+        elif child.tag.endswith("}tbl"):
+            rows = []
+            for r in Table(child, doc).rows:
+                cells: list[str] = []
+                for c in r.cells:
+                    txt = c.text.strip().replace("\n", " ")
+                    if not cells or cells[-1] != txt:  # الخلايا المدمجة تتكرر
+                        cells.append(txt)
+                rows.append(" | ".join(cells))
+            parts.append("[جدول]\n" + "\n".join(rows))
+    return "\n".join(parts), "العناصر", len(parts)
+
+
+def _pptx_shape_text(shape: Any, out: list[str]) -> None:
+    from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+    if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+        for s in shape.shapes:
+            _pptx_shape_text(s, out)
+        return
+    if getattr(shape, "has_text_frame", False) and shape.has_text_frame:
+        t = "\n".join(p.text.strip() for p in shape.text_frame.paragraphs if p.text.strip())
+        if t:
+            out.append(t)
+    if getattr(shape, "has_table", False) and shape.has_table:
+        out.append("[جدول]\n" + "\n".join(" | ".join(c.text.strip().replace("\n", " ") for c in r.cells) for r in shape.table.rows))
+
+
+def _read_pptx(data: bytes) -> tuple[str, str, int]:
+    try:
+        from pptx import Presentation
+    except ImportError as exc:
+        raise ValueError("ثبّت المكتبة python-pptx لقراءة ملفات PowerPoint.") from exc
+    prs = Presentation(BytesIO(data))
+    slides = []
+    for n, slide in enumerate(prs.slides, start=1):
+        out: list[str] = []
+        for shape in slide.shapes:
+            _pptx_shape_text(shape, out)
+        if slide.has_notes_slide and slide.notes_slide.notes_text_frame is not None:
+            note = slide.notes_slide.notes_text_frame.text.strip()
+            if note:
+                out.append(f"[ملاحظات المحاضر] {note}")
+        if out:
+            slides.append(f"--- الشريحة {n} ---\n" + "\n".join(out))
+    return "\n\n".join(slides), "الشرائح", len(prs.slides)
+
+
+def _read_xlsx(data: bytes) -> tuple[str, str, int]:
+    sheets = pd.read_excel(BytesIO(data), sheet_name=None, header=None, dtype=str, engine="openpyxl")
+    parts = []
+    for name, df in sheets.items():
+        df = df.dropna(how="all").dropna(axis=1, how="all").fillna("")
+        if df.empty:
+            continue
+        rows = [" | ".join(str(v).strip() for v in row) for row in df.iloc[:300, :30].itertuples(index=False)]
+        if len(df) > 300:
+            rows.append(f"(اقتُطع الجدول: عُرض أول 300 صف من {len(df)})")
+        parts.append(f"--- الورقة: {name} ---\n" + "\n".join(rows))
+    return "\n\n".join(parts), "الأوراق", len(sheets)
+
+
+def _read_txt(data: bytes) -> tuple[str, str, int]:
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        text = data.decode("cp1256", errors="replace")
+    return text, "الأسطر", text.count("\n") + 1
+
+
+@st.cache_data(show_spinner=False, max_entries=6)
+def process_document(file_bytes: bytes, filename: str, min_chars: int = 200) -> dict[str, Any]:
+    """يقرأ PDF / Word / PowerPoint / Excel / TXT محلياً. المفتاح هو المحتوى لا الاسم. الفشل يرفع ValueError ولا يُخزَّن."""
+    if len(file_bytes) > MAX_UPLOAD_MB * 1024 * 1024:
+        raise ValueError(f"حجم الملف يتجاوز {MAX_UPLOAD_MB}MB.")
+    ext = os.path.splitext(filename.lower())[1].lstrip(".")
+    readers = {"pdf": _read_pdf, "docx": _read_docx, "pptx": _read_pptx, "xlsx": _read_xlsx, "txt": _read_txt}
+    if ext not in readers:
+        raise ValueError("صيغة غير مدعومة. المدعوم: PDF و Word (docx) و PowerPoint (pptx) و Excel (xlsx) و TXT.")
+    try:
+        if ext in ("docx", "pptx", "xlsx"):
+            _check_zip(file_bytes)
+        text, unit, count = readers[ext](file_bytes)
     except ValueError:
         raise
     except Exception as exc:
-        raise ValueError("تعذّر قراءة الملف. تأكد أنه PDF سليم.") from exc
+        raise ValueError("تعذّر قراءة الملف. تأكد أنه سليم وغير تالف.") from exc
     if len(text.strip()) < min_chars:
-        raise ValueError("لم أستخرج نصاً كافياً؛ قد يكون الملف صوراً ممسوحة ضوئياً (يحتاج OCR).")
-    return {"text": text, "pages": total, "chars": len(text), "hash": hashlib.sha1(file_bytes).hexdigest()[:12]}
+        raise ValueError("لم أستخرج نصاً كافياً؛ قد يكون الملف صوراً ممسوحة ضوئياً (يحتاج OCR)." if ext == "pdf" else "لم أجد نصاً كافياً في الملف.")
+    return {"text": text, "pages": count, "unit": unit, "kind": ext.upper(), "chars": len(text), "hash": hashlib.sha1(file_bytes).hexdigest()[:12]}
 
 
 @st.cache_data(show_spinner=False, max_entries=32, ttl=86400)
@@ -531,10 +752,12 @@ def extract_plan(plan_text: str) -> dict[str, Any]:
 # ════════════════════════════════════════════════════════════════════════
 
 
-def run_task(task_key: str, fn: Callable[..., Any], args: tuple, spinner: str) -> bool:
+def run_task(task_key: str, fn: Callable[..., Any], args: tuple, spinner: str, fallback: Callable[..., Any] | None = None) -> bool:
+    """يشغّل المهمة؛ إن فشل الـ API ووُجد fallback محلي تُعرض نتيجة مبسطة للطالب بدل لا شيء."""
     ss = st.session_state
     ss.pop(f"err_{task_key}", None)
-    ss[f"job_{task_key}"] = (fn, args, spinner)
+    ss.pop(f"res_{task_key}", None)
+    ss[f"job_{task_key}"] = (fn, args, spinner, fallback)
     try:
         with st.spinner(spinner):
             ss[f"res_{task_key}"] = fn(*args)
@@ -543,18 +766,29 @@ def run_task(task_key: str, fn: Callable[..., Any], args: tuple, spinner: str) -
         ss[f"err_{task_key}"] = {"kind": exc.kind, "msg": exc.message}
     except Exception as exc:
         ss[f"err_{task_key}"] = {"kind": "other", "msg": f"{ERROR_MESSAGES['other']} ({type(exc).__name__})"}
+    if fallback:
+        try:
+            ss[f"res_{task_key}"] = fallback(*args)
+        except Exception:
+            pass
     return False
 
 
 def show_error(task_key: str) -> None:
-    err = st.session_state.get(f"err_{task_key}")
+    ss = st.session_state
+    err = ss.get(f"err_{task_key}")
     if not err:
         return
-    st.error(err["msg"])
-    job = st.session_state.get(f"job_{task_key}")
+    res = ss.get(f"res_{task_key}")
+    if isinstance(res, dict) and res.get("_offline"):
+        st.warning(err["msg"] + "\n\n✅ عرضنا لك أدناه **نتيجة محلية مبسطة** مولّدة داخل التطبيق دون ذكاء اصطناعي. "
+                   "اضغط «إعادة المحاولة» للحصول على التحليل الكامل.")
+    else:
+        st.error(err["msg"])
+    job = ss.get(f"job_{task_key}")
     if err["kind"] in RETRYABLE and job and st.button("🔄 إعادة المحاولة الآن", key=f"retry_{task_key}", type="primary"):
-        fn, args, spinner = job
-        run_task(task_key, fn, args, spinner)
+        fn, args, spinner, fallback = job
+        run_task(task_key, fn, args, spinner, fallback)
         st.rerun()
 
 
@@ -590,6 +824,9 @@ pre, code, [data-testid="stCode"], .stCodeBlock { direction: ltr !important; tex
 [data-testid="stSidebar"] { background: var(--side); direction: rtl; }
 [data-testid="stSidebar"] * { color: #eaf0ff !important; }
 [data-testid="stSidebar"] input { background: rgba(255,255,255,.1) !important; }
+[data-testid="stSidebar"] [data-baseweb="select"] > div { background: rgba(255,255,255,.1) !important; border-color: rgba(255,255,255,.25) !important; }
+[data-testid="stSidebar"] [data-testid="stExpander"] { background: rgba(255,255,255,.06) !important; border-color: rgba(255,255,255,.2) !important; }
+[data-testid="stSidebar"] button { background: rgba(255,255,255,.12) !important; border: 1px solid rgba(255,255,255,.25) !important; }
 [data-testid="stSidebarCollapsedControl"], [data-testid="collapsedControl"] {
     visibility: visible !important; display: flex !important; opacity: 1 !important;
     background: var(--primary); border-radius: 12px; min-width: 44px; min-height: 44px;
@@ -644,7 +881,15 @@ div.stButton > button[kind="primary"], div.stDownloadButton > button[kind="prima
 div.stButton > button, div.stDownloadButton > button { border-radius: 12px; min-height: 2.75rem; }
 [data-testid="stExpander"] { border-radius: 14px; background: var(--card); border-color: var(--line); }
 
-[data-testid="stPopover"] { position: fixed; bottom: 1rem; left: 1rem; z-index: 999990; width: auto !important; }
+.pomo { text-align: center; border-radius: 22px; padding: 1.3rem 1rem; margin: .6rem 0; color: #fff;
+    background: linear-gradient(130deg, #2b4fa3, #1e9a8a); box-shadow: 0 14px 34px rgba(30, 80, 150, .3); }
+.pomo .t { font-size: 4rem; font-weight: 800; line-height: 1.1; direction: ltr; font-variant-numeric: tabular-nums; color: #fff; }
+.pomo .s { opacity: .92; color: #fff; }
+.st-key-memgrid [data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; gap: .4rem; }
+.st-key-memgrid [data-testid="stColumn"], .st-key-memgrid [data-testid="column"] { min-width: 0 !important; flex: 1 1 0 !important; width: auto !important; }
+.st-key-memgrid button { min-height: 3.4rem; font-size: 1.5rem; padding: 0; }
+@media (max-width: 768px) { .pomo .t { font-size: 3rem; } }
+[data-testid="stPopover"] { position: fixed; bottom: calc(1rem + env(safe-area-inset-bottom, 0px)); left: 1rem; z-index: 999990; width: auto !important; }
 [data-testid="stPopover"] button { width: auto !important; border-radius: 99px; min-height: 3rem; padding: 0 1.1rem; font-weight: 800;
     color: #fff; background: linear-gradient(120deg, #1e9a8a, #3d70d6); border: 0; box-shadow: 0 10px 28px rgba(20, 90, 110, .4); }
 [data-testid="stPopoverBody"] { direction: rtl; max-width: min(92vw, 420px); }
@@ -737,6 +982,7 @@ def render_quiz(questions: list[dict[str, Any]], prefix: str) -> None:
         st.success(f"النتيجة النهائية: {correct}/{mcq_total} ({pct}%)")
 
 
+@st.fragment
 def render_flashcards(cards: list[dict[str, str]]) -> None:
     if not cards:
         st.info("لا توجد بطاقات.")
@@ -762,14 +1008,14 @@ def render_flashcards(cards: list[dict[str, str]]) -> None:
     st.markdown(
         f'<div class="fcard {side}"><div class="tag">{esc(cd["tag"] or ("الإجابة" if ss.fc_show else "السؤال"))}</div>'
         f'<div class="txt">{esc(text)}</div></div>', unsafe_allow_html=True)
-    st.button("🔄 قلب البطاقة", on_click=lambda: ss.update(fc_show=not ss.fc_show), key="fc_flip", type="primary", use_container_width=True)
+    st.button("🔄 قلب البطاقة", on_click=lambda: ss.update(fc_show=not ss.fc_show), key="fc_flip", type="primary", **FULL_BTN)
     c = st.columns(3)
-    c[0].button("⬅️ السابقة", on_click=go, args=(-1,), key="fc_prev", use_container_width=True)
-    c[1].button("✅ حفظتها", on_click=mark, key="fc_known_btn", use_container_width=True)
-    c[2].button("التالية ➡️", on_click=go, args=(1,), key="fc_next", use_container_width=True)
+    c[0].button("⬅️ السابقة", on_click=go, args=(-1,), key="fc_prev", **FULL_BTN)
+    c[1].button("✅ حفظتها", on_click=mark, key="fc_known_btn", **FULL_BTN)
+    c[2].button("التالية ➡️", on_click=go, args=(1,), key="fc_next", **FULL_BTN)
     c = st.columns(2)
-    c[0].button("🔀 خلط", on_click=shuffle, key="fc_shuffle", use_container_width=True)
-    c[1].button("🗑️ تصفير التقدّم", on_click=lambda: ss.update(fc_known=set(), fc_i=0, fc_show=False), key="fc_zero", use_container_width=True)
+    c[0].button("🔀 خلط", on_click=shuffle, key="fc_shuffle", **FULL_BTN)
+    c[1].button("🗑️ تصفير التقدّم", on_click=lambda: ss.update(fc_known=set(), fc_i=0, fc_show=False), key="fc_zero", **FULL_BTN)
 
 
 def _dot_label(text: str, width: int = 24) -> str:
@@ -1038,19 +1284,19 @@ def tab_lecture() -> None:
     ss = st.session_state
     left, right = st.columns([1.6, 1], gap="large")
     with left:
-        card("١ · ارفع المحاضرة", "ملف PDF يحتوي نصاً قابلاً للتحديد. تُحفظ النتائج في جلستك فلا تضيع عند التنقل بين التبويبات.")
-        uploaded = st.file_uploader("ملف المحاضرة", type=["pdf"], label_visibility="collapsed", key="lec_file")
+        card("١ · ارفع ملف المحاضرة", "يدعم PDF و Word (docx) و PowerPoint (pptx) و Excel (xlsx) و TXT، ويُقرأ محلياً قبل التحليل. تُحفظ النتائج في جلستك.")
+        uploaded = st.file_uploader("ملف المحاضرة", type=DOC_TYPES, label_visibility="collapsed", key="lec_file")
     with right:
         card("٢ · خيارات الشرح")
         level = st.select_slider("مستوى الشرح", ["مبسّط", "متوسط", "متقدم"], value="متوسط", key="lec_level")
-        go = st.button("🚀 ابدأ التحليل", type="primary", disabled=uploaded is None, key="lec_go", use_container_width=True)
+        go = st.button("🚀 ابدأ التحليل", type="primary", disabled=uploaded is None, key="lec_go", **FULL_BTN)
 
     if go and uploaded is not None:
         if uploaded.size > MAX_UPLOAD_MB * 1024 * 1024:
             st.error(f"حجم الملف يتجاوز {MAX_UPLOAD_MB}MB.")
         else:
             try:
-                info = process_pdf(uploaded.getvalue())
+                info = process_document(uploaded.getvalue(), uploaded.name)
             except ValueError as exc:
                 st.error(str(exc))
             else:
@@ -1059,7 +1305,7 @@ def tab_lecture() -> None:
                 ss.lec = {**info, "name": uploaded.name[:80]}
                 reset_prefix("lecq_", "fc_", "res_lecture", "err_lecture")
                 run_task("lecture", analyze_lecture, (info["text"], level),
-                         "جارٍ التحليل… قد يستغرق دقيقة، وتُعاد المحاولة تلقائياً عند ضغط الخوادم")
+                         "جارٍ التحليل… قد يستغرق دقيقة، وتُعاد المحاولة تلقائياً عند ضغط الخوادم", fallback=local_lecture)
 
     show_error("lecture")
     res = ss.get("res_lecture")
@@ -1067,7 +1313,7 @@ def tab_lecture() -> None:
         return
     lec = ss.get("lec", {})
     st.markdown(f'<div class="intro"><div class="t">{esc(res["title"])}</div><div class="c">{esc(res["overview"])}</div></div>', unsafe_allow_html=True)
-    st.caption(f"النموذج المستخدم: {res.get('_model', '—')} · الصفحات: {lec.get('pages', '—')}")
+    st.caption(f"النموذج: {res.get('_model', '—')} · {lec.get('kind', '')} · {lec.get('unit', 'الصفحات')}: {lec.get('pages', '—')}")
 
     t_sum, t_exp, t_cards, t_map, t_quiz, t_text = st.tabs(
         ["📋 الملخص", "👨‍🏫 الشرح", "🃏 البطاقات", "🧠 الخريطة", "✅ الاختبار", "📄 النص"])
@@ -1101,7 +1347,7 @@ def tab_lecture() -> None:
     with t_map:
         mm = res["mind_map"]
         if mm["branches"]:
-            st.graphviz_chart(mind_map_dot(mm, bool(ss.get("dark"))), use_container_width=True)
+            st.graphviz_chart(mind_map_dot(mm, bool(ss.get("dark"))), **FULL_GV)
             st.caption("الخطوط المتقطعة الخضراء = روابط ذهنية بين المحاور.")
             with st.expander("النسخة النصية للخريطة"):
                 st.markdown(f"**{mm['central']}**")
@@ -1126,7 +1372,7 @@ def tab_code() -> None:
     lang = c1.selectbox("اللغة", ["Python", "Java", "C++", "C", "JavaScript", "SQL", "غير محددة"], key="code_lang")
     mode = c2.selectbox("المهمة", ["شرح الكود خطوة بخطوة", "اكتشاف الأخطاء وتصحيح الكود", "حل مسألة خوارزمية من الصفر", "تحسين الكود وتحليل التعقيد"], key="code_mode")
     problem = st.text_area("السؤال أو الكود", height=240, key="code_in", placeholder="def solve(arr): ...")
-    if st.button("⚡ حلّ وشرح", type="primary", disabled=not problem.strip(), key="code_go", use_container_width=True):
+    if st.button("⚡ حلّ وشرح", type="primary", disabled=not problem.strip(), key="code_go", **FULL_BTN):
         run_task("code", solve_code, (problem.strip(), lang, mode), "جارٍ تحليل الكود…")
     show_error("code")
     r = ss.get("res_code")
@@ -1158,7 +1404,7 @@ def tab_code() -> None:
     if r["test_cases"]:
         st.markdown("#### 🧪 حالات اختبار")
         st.dataframe(pd.DataFrame(r["test_cases"]).rename(columns={"input": "المدخل", "expected": "المخرج المتوقع", "why": "السبب"}),
-                     hide_index=True, use_container_width=True)
+                     hide_index=True, **FULL_DF)
     for t in r["tips"]:
         st.markdown(f"- 💡 {t}")
 
@@ -1172,12 +1418,12 @@ def tab_radar() -> None:
     n = st.slider("عدد أسئلة الامتحان التجريبي", 5, 25, 12, key="rd_n")
     style_note = st.text_input("ملاحظات عن أسلوب الدكتور (اختياري)", key="rd_style", max_chars=300)
     pasted = st.text_area("الصق أسئلة الامتحانات السابقة", height=200, key="rd_text")
-    files = st.file_uploader("أو ارفع ملفات PDF لامتحانات سابقة", type=["pdf"], accept_multiple_files=True, key="rd_files")
-    if st.button("📡 حلّل ثم ولّد الامتحان", type="primary", key="rd_go", use_container_width=True):
+    files = st.file_uploader("أو ارفع ملفات PDF لامتحانات سابقة", type=DOC_TYPES, accept_multiple_files=True, key="rd_files")
+    if st.button("📡 حلّل ثم ولّد الامتحان", type="primary", key="rd_go", **FULL_BTN):
         chunks = [pasted.strip()] if pasted.strip() else []
         for f in files or []:
             try:
-                chunks.append(process_pdf(f.getvalue(), 50)["text"])
+                chunks.append(process_document(f.getvalue(), f.name, 50)["text"])
             except ValueError as exc:
                 st.warning(f"{f.name[:40]}: {exc}")
         joined = "\n\n=====\n\n".join(chunks)
@@ -1223,15 +1469,18 @@ def tab_gpa() -> None:
     prev_h = p1.number_input("الساعات المقطوعة سابقاً", 0, 250, 0, 1, key="gpa_ph")
     prev_gpa = p2.number_input("المعدل التراكمي السابق", 0.0, float(MAX_GPA), 0.0, 0.01, format="%.2f", key="gpa_pg")
 
-    base = pd.DataFrame({"المادة": [""] * 6, "الساعات": [3] * 6, "التقدير": [None] * 6})
+    default_df = pd.DataFrame({"المادة": [""] * 6, "الساعات": [3] * 6, "التقدير": [None] * 6})
+    if ss.pop("_fresh_gpa", False) or "gpa_base" not in ss:
+        ss.gpa_base = ss.get("gpa_latest", default_df)  # يُثبَّت طوال الزيارة ويُحدَّث عند دخول الصفحة
     edited = st.data_editor(
-        base, num_rows="dynamic", hide_index=True, key="gpa_table", use_container_width=True,
+        ss.gpa_base, num_rows="dynamic", hide_index=True, key="gpa_table", **FULL_ED,
         column_config={
             "المادة": st.column_config.TextColumn(max_chars=60),
             "الساعات": st.column_config.NumberColumn(min_value=1, max_value=6, step=1, format="%d"),
             "التقدير": st.column_config.SelectboxColumn(options=list(GRADE_POINTS.keys())),
         },
     )
+    ss.gpa_latest = edited
     sem_h, sem_qp = Decimal(0), Decimal(0)
     for _, row in edited.iterrows():
         pts = GRADE_POINTS.get(row["التقدير"]) if isinstance(row["التقدير"], str) else None
@@ -1266,7 +1515,7 @@ def tab_gpa() -> None:
             st.success(f"تحتاج معدلاً فصلياً ≈ {d2(max(need, Decimal(0)))} في {nxt} ساعة.")
     with st.expander("📘 سلّم الدرجات المعتمد في الحاسبة"):
         st.dataframe(pd.DataFrame({"التقدير": list(GRADE_POINTS), "النقاط": [d2(v) for v in GRADE_POINTS.values()]}),
-                     hide_index=True, use_container_width=True)
+                     hide_index=True, **FULL_DF)
         st.caption("⚠️ طابق هذه القيم مع لائحة الجامعة الرسمية؛ يمكن تعديلها من الثابت GRADE_POINTS أعلى الملف. "
                    "الحاسبة لا تعالج المواد المعادة/المستبدلة (احسب أثرها يدوياً بتعديل الساعات والمعدل السابق).")
 
@@ -1277,10 +1526,10 @@ def tab_plan() -> None:
     card("المستشار الأكاديمي: شجرة المتطلبات والجدول الإرشادي",
          "الخطة الافتراضية نموذج توضيحي وليست الخطة الرسمية. ارفع خطة تخصصك (PDF) لاستخراجها تلقائياً، أو الصق/عدّل السطور بصيغة: الرمز | الاسم | المتطلبات | الساعات | الفصل.")
 
-    plan_pdf = st.file_uploader("ارفع الخطة الدراسية الرسمية لتخصصك (PDF)", type=["pdf"], key="plan_pdf")
-    if st.button("🪄 استخرج الخطة من الملف", disabled=plan_pdf is None, key="plan_extract", use_container_width=True):
+    plan_pdf = st.file_uploader("ارفع الخطة الدراسية الرسمية لتخصصك (PDF)", type=DOC_TYPES, key="plan_pdf")
+    if st.button("🪄 استخرج الخطة من الملف", disabled=plan_pdf is None, key="plan_extract", **FULL_BTN):
         try:
-            info = process_pdf(plan_pdf.getvalue(), 100)
+            info = process_document(plan_pdf.getvalue(), plan_pdf.name, 100)
         except ValueError as exc:
             st.error(str(exc))
         else:
@@ -1299,12 +1548,14 @@ def tab_plan() -> None:
         return
 
     fmt = lambda c: f"{c} — {courses[c]['name']}"  # noqa: E731
+    ss["plan_passed"] = [c for c in ss.get("plan_passed", []) if c in courses]
     passed = set(st.multiselect("المواد التي نجحت فيها", list(courses), format_func=fmt, key="plan_passed"))
+    ss["plan_current"] = [c for c in ss.get("plan_current", []) if c in courses and c not in passed]
     current = set(st.multiselect("مواد تدرسها حالياً (تُعدّ منتهية عند تخطيط الفصل القادم)",
                                  [c for c in courses if c not in passed], format_func=fmt, key="plan_current"))
 
     status = course_status(courses, passed)
-    st.graphviz_chart(prereq_dot(courses, status, bool(ss.get("dark"))), use_container_width=True)
+    st.graphviz_chart(prereq_dot(courses, status, bool(ss.get("dark"))), **FULL_GV)
     st.caption("🟩 ناجح · 🟦 متاح للتسجيل · ⬜ مقفل (متطلبات ناقصة)")
 
     done = passed | current
@@ -1323,7 +1574,7 @@ def tab_plan() -> None:
         st.dataframe(pd.DataFrame([{"الرمز": c, "المادة": courses[c]["name"], "الساعات": courses[c]["hours"],
                                     "تفتح مواد لاحقة": sum(c in i["prereqs"] for i in courses.values()),
                                     "طول المسار اللاحق": depth[c]} for c in chosen]),
-                     hide_index=True, use_container_width=True)
+                     hide_index=True, **FULL_DF)
         st.success(f"المجموع: {sum(courses[c]['hours'] for c in chosen)} ساعة من أصل {cap}. كل مادة مقترحة متطلباتها منتهية بالكامل.")
     if skipped:
         st.caption("متاحة لكن لم تُدرج بسبب سقف الساعات: " + "، ".join(f"{c}" for c in skipped))
@@ -1339,7 +1590,7 @@ def tab_plan() -> None:
             rows.append({"الفصل": f"+{sem}", "المواد": "، ".join(pick), "الساعات": sum(courses[c]["hours"] for c in pick)})
             sim |= set(pick)
         if rows:
-            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+            st.dataframe(pd.DataFrame(rows), hide_index=True, **FULL_DF)
         rest = [c for c in courses if c not in sim]
         if rest:
             st.warning("مواد لا يمكن جدولتها (متطلب ناقص أو حلقة دائرية في الخطة): " + "، ".join(rest))
@@ -1367,8 +1618,10 @@ def tab_tasks() -> None:
             "المادة": ["CS201"], "الواجب": ["الواجب الأول"], "الموعد": [date.today() + timedelta(days=7)],
             "الأولوية": ["عالية"], "مكتمل": [False]}), 0
     card("متتبع الواجبات والمواعيد", "الجلسة مؤقتة؛ نزّل ملف النسخة الاحتياطية ثم ارفعه لاحقاً لاستعادة واجباتك.")
+    if ss.pop("_fresh_tasks", False) and "tasks_latest" in ss:
+        ss.tasks_base, ss.tasks_ver = ss.tasks_latest[cols].copy(), ss.tasks_ver + 1
     edited = st.data_editor(
-        ss.tasks_base, num_rows="dynamic", hide_index=True, key=f"tasks_ed_{ss.tasks_ver}", use_container_width=True,
+        ss.tasks_base, num_rows="dynamic", hide_index=True, key=f"tasks_ed_{ss.tasks_ver}", **FULL_ED,
         column_config={
             "المادة": st.column_config.TextColumn(max_chars=40),
             "الواجب": st.column_config.TextColumn(max_chars=120, width="large"),
@@ -1390,7 +1643,7 @@ def tab_tasks() -> None:
     if len(soon):
         st.warning("🔔 تقترب مواعيدها: " + "، ".join(f"{r['الواجب']} — {r['الموعد']}" for _, r in soon.iterrows()))
     st.download_button("💾 نسخة احتياطية (JSON)", df.assign(الموعد=df["الموعد"].astype(str)).to_json(orient="records", force_ascii=False),
-                       "assignments.json", "application/json", key="tasks_dl", use_container_width=True)
+                       "assignments.json", "application/json", key="tasks_dl", **FULL_DL)
     up = st.file_uploader("استعادة نسخة احتياطية", type=["json"], key="tasks_up")
     if up is not None and ss.get("tasks_up_name") != (up.name, up.size):
         try:
@@ -1428,7 +1681,7 @@ def tab_arena() -> None:
                 code = encode_arena(title, mcq)
                 base = get_app_url()
                 st.success(f"جاهز: {len(mcq)} سؤالاً.")
-                st.code(f"{base}/?arena={code}" if base else f"?arena={code}", language=None)
+                st.code(f"{base}/arena?arena={code}" if base else f"?arena={code}", language=None)
                 if not base:
                     st.caption("أضف APP_URL في secrets ليظهر الرابط كاملاً، أو شارك «رمز التحدي» التالي ليلصقه زميلك في تبويب الانضمام.")
                 st.code(code, language=None)
@@ -1589,7 +1842,7 @@ def tab_support() -> None:
         st.markdown(f"- {s}")
 
     note = st.text_input("أخبرنا بما يقلقك (اختياري، لرسالة شخصية)", key="sup_note", max_chars=300)
-    if st.button("✨ اكتب لي رسالة دعم شخصية", key="sup_ai", type="primary", use_container_width=True):
+    if st.button("✨ اكتب لي رسالة دعم شخصية", key="sup_ai", type="primary", **FULL_BTN):
         run_task("support", ai_support, (mood, note.strip(), days_left), "جارٍ كتابة الرسالة…")
     show_error("support")
     r = ss.get("res_support")
@@ -1621,6 +1874,273 @@ def tab_support() -> None:
     st.info("إن كان القلق شديداً أو مستمراً ويعيقك عن النوم أو الدراسة، تحدّث مع شخص تثق به أو مع مرشدك الأكاديمي أو مركز الإرشاد في الجامعة؛ طلب العون قوة وليس ضعفاً.")
 
 
+# ════════════════════════════════════════════════════════════════════════
+# 11c) التحليل المحلي الاحتياطي (يضمن ظهور نتيجة للطالب حتى لو تعطل كل مزوّدي الـ API)
+# ════════════════════════════════════════════════════════════════════════
+
+_STOP = set(
+    "في من على إلى الى عن أن إن هذا هذه ذلك تلك التي الذي الذين هو هي هم كان كانت يكون ما لا لم لن قد كل أو ثم أي حيث عند بين مع "
+    "هناك كما بعد قبل التي يتم تم عليه عليها فيه فيها منه منها إذا اذا لكن غير أكثر خلال حول نحو the and for are was were with that this from "
+    "have has not can will its their which also such each more than into over".split()
+)
+_DEF_RE = re.compile(r"^(.{3,60}?)\s+(?:هو|هي|هم|يعرّف|يُعرّف|تعرّف|يعرف|تعرف|عبارة عن|يقصد به|is|are|refers to|means|is defined as)\s+(.{10,})$", re.I)
+
+
+def local_lecture(text: str, level: str = "") -> dict[str, Any]:
+    """ملخص استخلاصي + بطاقات + أسئلة إكمال بالاعتماد على تكرار المصطلحات (دون أي API)."""
+    text = text[:MAX_LECTURE_CHARS]
+    body = re.sub(r"^---.*---$", "", text, flags=re.M)
+    sents, seen = [], set()
+    for s in re.split(r"(?<=[\.\!\?؟])\s+|\n+", body):
+        s = s.strip(" \t-•*#|")
+        if 25 <= len(s) <= 350 and s not in seen:
+            seen.add(s)
+            sents.append(s)
+    sents = sents[:1500]
+    if len(sents) < 3:
+        raise AIUnavailable("bad_output", "text too short for local analysis")
+    words = lambda s: [w for w in re.findall(r"\w{3,}", s.lower()) if not w.isdigit() and w not in _STOP]  # noqa: E731
+    freq = Counter(w for s in sents for w in words(s))
+
+    def score(i: int) -> float:
+        ws = set(words(sents[i]))
+        return sum(freq[w] for w in ws) / (len(ws) ** 0.6 + 1) if ws else 0.0
+
+    ranked = sorted(range(len(sents)), key=score, reverse=True)
+    top = sorted(ranked[:12])
+    rng = random.Random(hashlib.md5(text[:2000].encode("utf-8", "ignore")).hexdigest())
+
+    sections = []
+    for k in range(0, len(top), 4):
+        grp = top[k:k + 4]
+        kw = Counter(w for i in grp for w in words(sents[i])).most_common(1)
+        sections.append({"heading": f"محور: {kw[0][0] if kw else k // 4 + 1}", "points": [sents[i][:300] for i in grp]})
+
+    cards = []
+    for s in sents:
+        m = _DEF_RE.match(s)
+        if m:
+            cards.append({"front": f"ما المقصود بـ «{m.group(1).strip()}»؟", "back": s, "tag": "تعريف"})
+        if len(cards) >= 12:
+            break
+
+    pool = [w for w, c in freq.most_common(80) if len(w) >= 4]
+    quiz = []
+    for i in ranked[:40]:
+        s = sents[i]
+        cands = [w for w in words(s) if len(w) >= 4 and freq[w] >= 2] or [w for w in words(s) if len(w) >= 5]
+        if not cands:
+            continue
+        kw = max(cands, key=lambda w: (freq[w], len(w)))
+        blanked = re.sub(re.escape(kw), "_____", s, count=1, flags=re.I)
+        if blanked == s:
+            continue
+        if len(cards) < 12:
+            cards.append({"front": "أكمل: " + blanked, "back": kw, "tag": "إكمال"})
+        others = [w for w in pool if w != kw and abs(len(w) - len(kw)) <= 4]
+        if len(others) >= 3 and len(quiz) < 8:
+            opts = rng.sample(others, 3) + [kw]
+            rng.shuffle(opts)
+            q = norm_question({"question": "أكمل الفراغ: " + blanked, "type": "اختيار من متعدد", "options": opts,
+                               "correct_answer": kw, "explanation": "الجملة الأصلية: " + s[:300]})
+            if q:
+                quiz.append(q)
+    out = normalize_lecture({
+        "title": "ملخص محلي للمحاضرة", "overview": " ".join(sents[i] for i in top[:2])[:600],
+        "summary_sections": sections, "key_takeaways": [sents[i][:220] for i in ranked[:5]],
+        "flashcards": cards,
+        "mind_map": {"central": "ملخص المحاضرة", "branches": [{"title": sec["heading"], "points": [p[:70] for p in sec["points"][:3]]} for sec in sections], "links": []},
+        "study_tips": ["اقرأ الملخص ثم أغلقه وحاول استرجاع النقاط من ذاكرتك.", "اختبر نفسك بالبطاقات وأسئلة الإكمال قبل مراجعة النص الأصلي.",
+                       "هذه نتيجة مبسطة بلا ذكاء اصطناعي؛ أعد المحاولة لاحقاً للحصول على شرح وأسئلة أعمق."],
+    })
+    out["quiz"] = quiz
+    out["_model"], out["_offline"] = "محلي (دون ذكاء اصطناعي)", True
+    return out
+
+
+# ════════════════════════════════════════════════════════════════════════
+# 11d) مؤقت بومودورو + ألعاب المكافأة
+# ════════════════════════════════════════════════════════════════════════
+
+POMO_MAX_FOCUS, POMO_MAX_BREAK = 50, 10
+GAME_EMOJIS = ["📚", "✏️", "🧠", "💡", "🎓", "🔬"]
+
+
+def _pomo() -> dict[str, Any]:
+    ss = st.session_state
+    if "pomo" not in ss:
+        p: dict[str, Any] = {"state": "idle", "end": 0.0, "focus": 25, "brk": 5, "done": 0, "minutes": 0, "reward": False}
+        try:  # استعادة جلسة جارية بعد إعادة تحميل المتصفح (الحالة محفوظة في الرابط)
+            q = st.query_params
+            if q.get("ps") in ("f", "b") and str(q.get("pe", "")).isdigit():
+                end, f, b = float(q["pe"]), int(q.get("pf", 25)), int(q.get("pb", 5))
+                if abs(end - time.time()) < 3 * 3600:
+                    p.update(state="focus" if q["ps"] == "f" else "break", end=end, focus=min(max(f, 1), POMO_MAX_FOCUS), brk=min(max(b, 1), POMO_MAX_BREAK))
+        except Exception:
+            pass
+        ss["pomo"] = p
+    return ss["pomo"]
+
+
+def _pomo_sync() -> None:
+    p = _pomo()
+    try:
+        q = st.query_params
+        if p["state"] in ("focus", "break"):
+            q["pe"], q["ps"], q["pf"], q["pb"] = str(int(p["end"])), p["state"][0], str(p["focus"]), str(p["brk"])
+        else:
+            for k in ("pe", "ps", "pf", "pb"):
+                q.pop(k, None)
+    except Exception:
+        pass
+
+
+def _pomo_start_focus() -> None:
+    ss = st.session_state
+    f, b = int(ss.pomo_focus), int(ss.pomo_brk)
+    _pomo().update(state="focus", end=time.time() + f * 60, focus=f, brk=b, reward=False)
+    _pomo_sync()
+
+
+def _pomo_start_break() -> None:
+    p = _pomo()
+    p.update(state="break", end=time.time() + p["brk"] * 60)
+    _pomo_sync()
+
+
+def _pomo_stop() -> None:
+    _pomo().update(state="idle")
+    _pomo_sync()
+
+
+def _pomo_clock() -> None:
+    """يُحدَّث كل ثانية (st.fragment) والزمن محسوب من ساعة الجدار فلا يتأثر بإعادة تحميل الصفحة."""
+    p = _pomo()
+    focus = p["state"] == "focus"
+    total = (p["focus"] if focus else p["brk"]) * 60
+    left = max(0.0, p["end"] - time.time())
+    mm, sec = divmod(int(left + 0.999), 60)
+    st.markdown(f'<div class="pomo"><div class="s">{"🎯 وقت التركيز" if focus else "☕ وقت الاستراحة"}</div><div class="t">{mm:02d}:{sec:02d}</div></div>',
+                unsafe_allow_html=True)
+    st.progress(min(1.0, max(0.0, 1 - left / total)) if total else 1.0)
+    if left <= 0:
+        if focus:
+            p.update(state="focus_done", done=p["done"] + 1, minutes=p["minutes"] + p["focus"], reward=True)
+            st.toast("🎉 أنهيت جلسة التركيز! مكافأتك جاهزة")
+        else:
+            p.update(state="idle")
+            st.toast("☕ انتهت الاستراحة")
+        _pomo_sync()
+        st.rerun()
+
+
+def _mem_new() -> None:
+    cards = GAME_EMOJIS * 2
+    random.shuffle(cards)
+    st.session_state.mem = {"cards": cards, "open": [], "matched": set(), "moves": 0}
+
+
+def _mem_flip(i: int) -> None:
+    m = st.session_state.mem
+    if len(m["open"]) == 2:
+        m["open"] = []  # أغلق الزوج غير المتطابق السابق
+    if i in m["matched"] or i in m["open"]:
+        return
+    m["open"].append(i)
+    if len(m["open"]) == 2:
+        m["moves"] += 1
+        a, b = m["open"]
+        if m["cards"][a] == m["cards"][b]:
+            m["matched"] |= {a, b}
+            m["open"] = []
+
+
+@st.fragment
+def memory_game() -> None:
+    ss = st.session_state
+    if "mem" not in ss:
+        _mem_new()
+    m = ss.mem
+    st.caption(f"الحركات: {m['moves']} · الأزواج: {len(m['matched']) // 2}/{len(GAME_EMOJIS)}")
+    with st.container(key="memgrid"):
+        for r in range(3):
+            cols = st.columns(4)
+            for c in range(4):
+                i = r * 4 + c
+                shown = i in m["matched"] or i in m["open"]
+                cols[c].button(m["cards"][i] if shown else "❓", key=f"mem_{i}", on_click=_mem_flip, args=(i,),
+                               disabled=i in m["matched"], **FULL_BTN)
+    if len(m["matched"]) == len(m["cards"]):
+        st.success(f"🎉 أحسنت! أنهيت اللعبة في {m['moves']} حركة.")
+    st.button("🔄 لعبة جديدة", key="mem_new", on_click=_mem_new)
+
+
+def _guess_new() -> None:
+    st.session_state.guess = {"n": random.randint(1, 100), "tries": 0, "max": 7, "hint": "", "won": False}
+
+
+def _guess_try() -> None:
+    g = st.session_state.guess
+    if g["won"] or g["tries"] >= g["max"]:
+        return
+    v = int(st.session_state.guess_in)
+    g["tries"] += 1
+    if v == g["n"]:
+        g["won"], g["hint"] = True, f"🎉 صحيح! الرقم {g['n']} وخمّنته من {g['tries']} محاولة."
+    else:
+        g["hint"] = "⬆️ الرقم أكبر" if v < g["n"] else "⬇️ الرقم أصغر"
+
+
+@st.fragment
+def guess_game() -> None:
+    ss = st.session_state
+    if "guess" not in ss:
+        _guess_new()
+    g = ss.guess
+    st.write("فكّرتُ في رقم بين **1 و100**. لديك 7 محاولات!")
+    st.number_input("تخمينك", 1, 100, 50, 1, key="guess_in", disabled=g["won"] or g["tries"] >= g["max"])
+    st.button("🎯 خمّن", key="guess_go", on_click=_guess_try, type="primary", disabled=g["won"] or g["tries"] >= g["max"])
+    if g["hint"]:
+        (st.success if g["won"] else st.info)(g["hint"])
+    if not g["won"] and g["tries"] >= g["max"]:
+        st.error(f"انتهت المحاولات! كان الرقم {g['n']}.")
+    st.caption(f"المحاولات: {g['tries']}/{g['max']}")
+    st.button("🔄 رقم جديد", key="guess_new", on_click=_guess_new)
+
+
+def tab_pomodoro() -> None:
+    ss = st.session_state
+    p = _pomo()
+    card("⏱️ مؤقت بومودورو الدراسي", f"ركّز حتى {POMO_MAX_FOCUS} دقيقة ثم استرح حتى {POMO_MAX_BREAK} دقائق. عند إنهاء جلسة التركيز بنجاح تنال لعبة مصغرة مكافأةً لك 🎮")
+    running = p["state"] in ("focus", "break")
+    c1, c2 = st.columns(2)
+    c1.slider("مدة جلسة الدراسة (دقيقة)", 5, POMO_MAX_FOCUS, 25, 1, key="pomo_focus", disabled=running)
+    c2.slider("مدة الاستراحة (دقيقة)", 1, POMO_MAX_BREAK, 5, 1, key="pomo_brk", disabled=running)
+    stat_grid([("جلسات مكتملة", p["done"]), ("دقائق تركيز", p["minutes"]),
+               ("الحالة", {"idle": "جاهز", "focus": "تركيز", "break": "استراحة", "focus_done": "أحسنت!"}[p["state"]])])
+
+    if p["state"] == "idle":
+        st.button("▶️ ابدأ جلسة دراسة", key="pomo_go", on_click=_pomo_start_focus, type="primary", **FULL_BTN)
+        st.button("🎁 جرّب لعبة المكافأة الآن", key="pomo_try", on_click=lambda: p.update(reward=True), **FULL_BTN)
+    elif p["state"] == "focus":
+        st.fragment(_pomo_clock, run_every=1)()
+        st.button("⏹ إلغاء الجلسة (دون مكافأة)", key="pomo_cancel", on_click=_pomo_stop, **FULL_BTN)
+        st.caption("أبقِ هذه الصفحة مفتوحة. الوقت محسوب بالساعة الفعلية فلن يضيع إن انطفأت الشاشة قليلاً.")
+    elif p["state"] == "focus_done":
+        st.success(f"🎉 أكملت {p['focus']} دقيقة تركيز! استحققت مكافأتك.")
+        st.button(f"☕ ابدأ استراحة {p['brk']} دقائق", key="pomo_brk_go", on_click=_pomo_start_break, type="primary", **FULL_BTN)
+        st.button("⏭ تخطي الاستراحة", key="pomo_skip0", on_click=_pomo_stop, **FULL_BTN)
+    elif p["state"] == "break":
+        st.fragment(_pomo_clock, run_every=1)()
+        st.button("⏭ تخطي الاستراحة", key="pomo_skip", on_click=_pomo_stop, **FULL_BTN)
+
+    if p["reward"]:
+        st.markdown('<div class="intro"><div class="t">🎮 مكافأتك: لعبة سريعة</div><div class="c">استمتع بدقيقتين ثم عد للتركيز.</div></div>', unsafe_allow_html=True)
+        pick = st.radio("اختر اللعبة", ["🧠 تحدي الذاكرة", "🔢 خمّن الرقم"], horizontal=True, key="game_pick")
+        memory_game() if pick.startswith("🧠") else guess_game()
+        st.button("✖ إغلاق اللعبة", key="game_close", on_click=lambda: p.update(reward=False))
+
+
 def tab_export() -> None:
     ss = st.session_state
     res = ss.get("res_lecture")
@@ -1628,7 +2148,7 @@ def tab_export() -> None:
     if not res:
         st.info("حلّل محاضرة أولاً لتفعيل التصدير.")
         return
-    if st.button("🛠️ تجهيز الملفات", type="primary", key="exp_build", use_container_width=True):
+    if st.button("🛠️ تجهيز الملفات", type="primary", key="exp_build", **FULL_BTN):
         with st.spinner("جارٍ تجهيز الملفات…"):
             ss.exports = {"md": build_markdown(res), "json": json.dumps(res, ensure_ascii=False, indent=2).encode("utf-8")}
             if HAS_DOCX:
@@ -1639,15 +2159,15 @@ def tab_export() -> None:
     if not ex:
         return
     if ex.get("docx"):
-        st.download_button("📘 Word", ex["docx"], "slidemind.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", key="dl_docx", use_container_width=True)
+        st.download_button("📘 Word", ex["docx"], "slidemind.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", key="dl_docx", **FULL_DL)
     else:
         st.caption("ثبّت python-docx لتفعيل Word")
     if ex.get("pdf"):
-        st.download_button("📕 PDF", ex["pdf"], "slidemind.pdf", "application/pdf", key="dl_pdf", use_container_width=True)
+        st.download_button("📕 PDF", ex["pdf"], "slidemind.pdf", "application/pdf", key="dl_pdf", **FULL_DL)
     else:
         st.caption("PDF العربي يحتاج: reportlab, arabic-reshaper, python-bidi وخطاً عربياً (مجلد fonts/ أو DejaVu)")
-    st.download_button("📝 Markdown", ex["md"], "slidemind.md", "text/markdown", key="dl_md", use_container_width=True)
-    st.download_button("🧾 JSON", ex["json"], "slidemind.json", "application/json", key="dl_json", use_container_width=True)
+    st.download_button("📝 Markdown", ex["md"], "slidemind.md", "text/markdown", key="dl_md", **FULL_DL)
+    st.download_button("🧾 JSON", ex["json"], "slidemind.json", "application/json", key="dl_json", **FULL_DL)
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -1655,30 +2175,330 @@ def tab_export() -> None:
 # ════════════════════════════════════════════════════════════════════════
 
 
-def main() -> None:
-    ss = st.session_state
-    ss.setdefault("dark", False)
+# ════════════════════════════════════════════════════════════════════════
+# 11e) الحسابات والحفظ الدائم (SQLite افتراضياً، أو PostgreSQL عبر DATABASE_URL)
+# ════════════════════════════════════════════════════════════════════════
 
-    with st.sidebar:
-        st.markdown("### ◈ SlideMind AI")
-        ss.dark = st.toggle("🌙 الوضع الداكن", value=ss.dark, key="dark_toggle")
-        st.markdown("---")
-        st.markdown("✅ الخدمة جاهزة" if get_api_key() else "⚠️ لم يُضبط GEMINI_API_KEY")
-        st.caption("النماذج (بالترتيب): " + " ← ".join(MODEL_CHAIN))
-        if st.button("🧹 مسح الذاكرة المؤقتة", key="clear_cache"):
-            st.cache_data.clear()
-            _DEAD_MODELS.clear()
-            st.toast("تم مسح الكاش")
-        if st.button("↺ بدء جلسة جديدة", key="reset_session"):
+PBKDF2_ITERS = 310_000
+MAX_FAILS, LOCK_SECONDS = 5, 300
+_EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,190}\.[^@\s]{2,}$")
+SIMPLE_KEYS = ["dark", "provider_pref", "gpa_ph", "gpa_pg", "gpa_target", "gpa_next", "plan_text", "plan_passed", "plan_current",
+               "plan_cap", "pomo_focus", "pomo_brk", "sup_mood"]
+_RANGES = {"gpa_ph": (0, 250, int), "gpa_pg": (0.0, float(MAX_GPA), float), "gpa_target": (0.0, float(MAX_GPA), float),
+           "gpa_next": (1, 30, int), "plan_cap": (9, 21, int), "pomo_focus": (5, 50, int), "pomo_brk": (1, 10, int)}
+_LECTURE_KEYS = {"title", "overview", "summary_sections", "key_takeaways", "teacher_explanations", "flashcards", "mind_map", "quiz", "study_tips"}
+_RADAR_KEYS = {"style_profile", "patterns", "predicted_topics", "mock_exam", "exam_tips"}
+_TASK_COLS = ["المادة", "الواجب", "الموعد", "الأولوية", "مكتمل"]
+
+
+@st.cache_resource(show_spinner=False)
+def get_engine():
+    from sqlalchemy import create_engine, text
+
+    url = get_key("DATABASE_URL") or "sqlite:///slidemind.db"
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+    engine = create_engine(url, pool_pre_ping=True, future=True)
+    with engine.begin() as c:
+        c.execute(text("CREATE TABLE IF NOT EXISTS users (id VARCHAR(32) PRIMARY KEY, email VARCHAR(254) UNIQUE NOT NULL, "
+                       "salt VARCHAR(64) NOT NULL, pw_hash VARCHAR(128) NOT NULL, iters INTEGER NOT NULL, "
+                       "fails INTEGER NOT NULL DEFAULT 0, locked_until BIGINT NOT NULL DEFAULT 0, created BIGINT NOT NULL)"))
+        c.execute(text("CREATE TABLE IF NOT EXISTS user_data (user_id VARCHAR(32) NOT NULL, k VARCHAR(64) NOT NULL, "
+                       "v TEXT NOT NULL, updated BIGINT NOT NULL, PRIMARY KEY (user_id, k))"))
+    return engine
+
+
+def _pw_hash(pw: str, salt_hex: str, iters: int) -> str:
+    return hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), bytes.fromhex(salt_hex), iters).hex()
+
+
+def _check_credentials(email: str, pw: str) -> str | None:
+    if not _EMAIL_RE.match(email) or len(email) > 254:
+        return "صيغة البريد الإلكتروني غير صحيحة."
+    domains = [d.strip().lower().lstrip("@") for d in get_key("ALLOWED_EMAIL_DOMAINS").split(",") if d.strip()]
+    if domains and email.split("@")[-1] not in domains:
+        return "يُسمح بالتسجيل ببريد الجامعة فقط: " + "، ".join(domains)
+    if not 8 <= len(pw) <= 128:
+        return "كلمة المرور يجب أن تكون بين 8 و128 حرفاً."
+    return None
+
+
+def db_register(email: str, pw: str) -> tuple[str | None, str]:
+    from sqlalchemy import text
+
+    email = email.strip().lower()
+    err = _check_credentials(email, pw)
+    if err:
+        return None, err
+    uid, salt = uuid.uuid4().hex, os.urandom(16).hex()
+    try:
+        with get_engine().begin() as c:
+            if c.execute(text("SELECT 1 FROM users WHERE email=:e"), {"e": email}).fetchone():
+                return None, "هذا البريد مسجّل مسبقاً؛ سجّل الدخول بدلاً من ذلك."
+            c.execute(text("INSERT INTO users (id,email,salt,pw_hash,iters,fails,locked_until,created) VALUES (:i,:e,:s,:h,:n,0,0,:t)"),
+                      {"i": uid, "e": email, "s": salt, "h": _pw_hash(pw, salt, PBKDF2_ITERS), "n": PBKDF2_ITERS, "t": int(time.time())})
+    except Exception:
+        return None, "تعذّر إنشاء الحساب الآن. حاول لاحقاً."
+    return uid, ""
+
+
+def db_login(email: str, pw: str) -> tuple[str | None, str]:
+    from sqlalchemy import text
+
+    email, now = email.strip().lower(), int(time.time())
+    generic = "البريد الإلكتروني أو كلمة المرور غير صحيحة."
+    if not _EMAIL_RE.match(email) or not pw:
+        return None, generic
+    try:
+        with get_engine().begin() as c:
+            row = c.execute(text("SELECT id,salt,pw_hash,iters,fails,locked_until FROM users WHERE email=:e"), {"e": email}).fetchone()
+            if row and row.locked_until > now:
+                return None, f"محاولات كثيرة خاطئة. انتظر {max(1, (row.locked_until - now) // 60 + 1)} دقائق ثم أعد المحاولة."
+            calc = _pw_hash(pw, row.salt if row else "00" * 16, row.iters if row else PBKDF2_ITERS)  # نفس الكلفة حتى لو البريد غير موجود
+            if row and hmac.compare_digest(calc, row.pw_hash):
+                c.execute(text("UPDATE users SET fails=0, locked_until=0 WHERE id=:i"), {"i": row.id})
+                return row.id, ""
+            if row:
+                fails = row.fails + 1
+                c.execute(text("UPDATE users SET fails=:f, locked_until=:l WHERE id=:i"),
+                          {"f": 0 if fails >= MAX_FAILS else fails, "l": now + LOCK_SECONDS if fails >= MAX_FAILS else 0, "i": row.id})
+            return None, generic
+    except Exception:
+        return None, "تعذّر الاتصال بقاعدة البيانات الآن."
+
+
+def db_load(uid: str) -> dict[str, Any]:
+    from sqlalchemy import text
+
+    with get_engine().begin() as c:
+        rows = c.execute(text("SELECT k,v FROM user_data WHERE user_id=:u"), {"u": uid}).fetchall()
+    out = {}
+    for k, v in rows:
+        try:
+            out[k] = json.loads(v)
+        except ValueError:
+            continue
+    return out
+
+
+def db_save(uid: str, key: str, js: str) -> None:
+    from sqlalchemy import text
+
+    with get_engine().begin() as c:
+        p = {"u": uid, "k": key, "v": js, "t": int(time.time())}
+        if c.execute(text("UPDATE user_data SET v=:v, updated=:t WHERE user_id=:u AND k=:k"), p).rowcount == 0:
+            c.execute(text("INSERT INTO user_data (user_id,k,v,updated) VALUES (:u,:k,:v,:t)"), p)
+
+
+def db_delete_user(uid: str) -> None:
+    from sqlalchemy import text
+
+    with get_engine().begin() as c:
+        c.execute(text("DELETE FROM user_data WHERE user_id=:u"), {"u": uid})
+        c.execute(text("DELETE FROM users WHERE id=:u"), {"u": uid})
+
+
+def _tasks_df(rows: Any) -> pd.DataFrame | None:
+    if not isinstance(rows, list) or not rows:
+        return None
+    df = pd.DataFrame(rows[:500]).reindex(columns=_TASK_COLS)
+    df["الموعد"] = pd.to_datetime(df["الموعد"], errors="coerce").dt.date
+    for c in ("المادة", "الواجب"):
+        df[c] = df[c].fillna("").astype(str).str[:120]
+    df["الأولوية"] = df["الأولوية"].where(df["الأولوية"].isin(["عالية", "متوسطة", "منخفضة"]), "متوسطة")
+    df["مكتمل"] = df["مكتمل"].fillna(False).astype(bool)
+    return df
+
+
+def persist_snapshot() -> dict[str, Any]:
+    """كل ما يُحفظ للمستخدم. لا تُحفظ مفاتيح API ولا الملفات المرفوعة ولا نص المحاضرة الخام."""
+    ss, snap = st.session_state, {}
+    for k in SIMPLE_KEYS:
+        if k in ss:
+            snap[k] = ss[k]
+    if isinstance(ss.get("gpa_latest"), pd.DataFrame):
+        snap["gpa_latest"] = json.loads(ss["gpa_latest"].to_json(orient="records", force_ascii=False))
+    t = ss.get("tasks_latest")
+    if isinstance(t, pd.DataFrame):
+        snap["tasks_latest"] = json.loads(t.assign(الموعد=t["الموعد"].astype(str)).to_json(orient="records", force_ascii=False))
+    if isinstance(ss.get("pomo"), dict):
+        snap["pomo"] = {"done": ss["pomo"]["done"], "minutes": ss["pomo"]["minutes"]}
+    for k in ("res_lecture", "res_radar"):
+        if isinstance(ss.get(k), dict) and not ss[k].get("_offline"):
+            snap[k] = ss[k]
+    if isinstance(ss.get("lec"), dict):
+        snap["lec"] = {k: v for k, v in ss["lec"].items() if k != "text"}
+    return snap
+
+
+def apply_user_data(data: dict[str, Any]) -> None:
+    ss = st.session_state
+    for k, (lo, hi, typ) in _RANGES.items():
+        if k in data:
+            try:
+                ss[k] = min(max(typ(data[k]), lo), hi)
+            except (TypeError, ValueError):
+                pass
+    if data.get("provider_pref") in PROVIDER_LABELS:
+        ss["provider_pref"] = data["provider_pref"]
+    if data.get("sup_mood") in MOOD_ADVICE:
+        ss["sup_mood"] = data["sup_mood"]
+    if isinstance(data.get("plan_text"), str) and data["plan_text"].strip():
+        ss["plan_text"] = data["plan_text"][:20000]
+    for k in ("plan_passed", "plan_current"):
+        if isinstance(data.get(k), list):
+            ss[k] = [str(x)[:15] for x in data[k]][:200]
+    if "dark" in data:
+        ss.dark = ss["dark_toggle"] = bool(data["dark"])
+    rows = data.get("gpa_latest")
+    if isinstance(rows, list) and rows:
+        df = pd.DataFrame(rows[:60]).reindex(columns=["المادة", "الساعات", "التقدير"])
+        df["المادة"] = df["المادة"].fillna("").astype(str).str[:60]
+        df["الساعات"] = pd.to_numeric(df["الساعات"], errors="coerce").clip(1, 6)
+        df["التقدير"] = df["التقدير"].where(df["التقدير"].isin(list(GRADE_POINTS)), None)
+        ss.gpa_latest, ss["_fresh_gpa"] = df, True
+        ss.pop("gpa_table", None)
+    tdf = _tasks_df(data.get("tasks_latest"))
+    if tdf is not None:
+        ss.tasks_latest, ss["_fresh_tasks"] = tdf, True
+        ss.setdefault("tasks_base", tdf)
+        ss.setdefault("tasks_ver", 0)
+    if isinstance(data.get("pomo"), dict):
+        p = _pomo()
+        for k in ("done", "minutes"):
+            try:
+                p[k] = max(0, int(data["pomo"].get(k, 0)))
+            except (TypeError, ValueError):
+                pass
+    for k, req in (("res_lecture", _LECTURE_KEYS), ("res_radar", _RADAR_KEYS)):
+        if isinstance(data.get(k), dict) and req <= set(data[k]):
+            ss[k] = data[k]
+    if isinstance(data.get("lec"), dict):
+        ss["lec"] = data["lec"]
+
+
+def autosave() -> None:
+    """يحفظ فقط المفاتيح التي تغيّرت منذ آخر حفظ."""
+    ss = st.session_state
+    uid = ss.get("uid")
+    if not uid:
+        return
+    try:
+        saved = ss.setdefault("_saved", {})
+        for k, v in persist_snapshot().items():
+            js = json.dumps(v, ensure_ascii=False, default=str)
+            if len(js) > 1_500_000:
+                continue
+            h = hashlib.md5(js.encode("utf-8")).hexdigest()
+            if saved.get(k) != h:
+                db_save(uid, k, js)
+                saved[k] = h
+        ss["_save_err"] = False
+    except Exception:
+        ss["_save_err"] = True
+
+
+def _logged_in(uid: str, email: str) -> None:
+    ss = st.session_state
+    ss["uid"], ss["user_email"], ss["_saved"] = uid, email.strip().lower(), {}
+    try:
+        apply_user_data(db_load(uid))
+    except Exception:
+        ss["_save_err"] = True
+    st.rerun()
+
+
+def account_sidebar() -> None:
+    ss = st.session_state
+    st.markdown("#### 👤 حسابي")
+    try:
+        get_engine()
+    except Exception:
+        st.caption("⚠️ الحفظ الدائم غير متاح حالياً (قاعدة البيانات). يعمل التطبيق كزائر.")
+        return
+    if ss.get("uid"):
+        st.caption(f"✅ {ss.get('user_email', '')}")
+        st.caption("⚠️ تعذّر الحفظ آخر مرة؛ سنعيد المحاولة تلقائياً." if ss.get("_save_err") else "💾 يُحفظ تقدّمك تلقائياً")
+        with st.expander("إدارة الحساب"):
+            st.caption("المحفوظ: المعدل والخطة والواجبات والبومودورو ونتائج التحليل. لا تُحفظ مفاتيح API ولا الملفات المرفوعة.")
+            st.download_button("⬇️ تنزيل بياناتي (JSON)", json.dumps(persist_snapshot(), ensure_ascii=False, default=str, indent=2),
+                               "my_slidemind_data.json", "application/json", key="acct_export")
+            sure = st.checkbox("أؤكد حذف حسابي وكل بياناتي نهائياً", key="acct_sure")
+            if st.button("🗑️ حذف حسابي", disabled=not sure, key="acct_delete"):
+                try:
+                    db_delete_user(ss["uid"])
+                except Exception:
+                    st.error("تعذّر الحذف الآن.")
+                else:
+                    for k in list(ss.keys()):
+                        del ss[k]
+                    st.rerun()
+        if st.button("🚪 تسجيل الخروج", key="acct_logout"):
             for k in list(ss.keys()):
                 del ss[k]
             st.rerun()
-        st.markdown("---")
-        st.caption("🔒 الملفات تُعالج في الذاكرة فقط ولا تُحفظ على القرص. النتائج للمراجعة وتحتاج تحقق الطالب.")
+        return
+    st.caption("أنت تتصفح كزائر: لن يُحفظ تقدّمك. أنشئ حساباً لحفظه واستعادته على أي جهاز.")
+    mode = st.radio("الوضع", ["دخول", "حساب جديد"], horizontal=True, label_visibility="collapsed", key="auth_mode")
+    with st.form("auth_form"):
+        email = st.text_input("البريد الإلكتروني", max_chars=254)
+        pw = st.text_input("كلمة المرور", type="password", max_chars=128)
+        pw2 = st.text_input("تأكيد كلمة المرور", type="password", max_chars=128) if mode == "حساب جديد" else None
+        go = st.form_submit_button("إنشاء الحساب" if mode == "حساب جديد" else "دخول")
+    if go:
+        if pw2 is not None and pw != pw2:
+            st.error("كلمتا المرور غير متطابقتين.")
+        else:
+            uid, err = (db_register if pw2 is not None else db_login)(email, pw)
+            if uid:
+                _logged_in(uid, email)
+            else:
+                st.error(err)
+    st.caption("لا يوجد استعادة لكلمة المرور حالياً؛ احتفظ بها. البريد لا يُتحقق منه.")
 
-    inject_css(bool(ss.dark))
-    support_popover()
 
+_PAGES: dict[str, Any] = {}
+
+
+def _enter(name: str) -> None:
+    """يعلّم أول دخول للصفحة (لاستعادة الجداول المحفوظة)."""
+    ss = st.session_state
+    if ss.get("_cur_page") != name:
+        ss["_cur_page"] = name
+        ss[f"_fresh_{name}"] = True
+
+
+def _make_page(name: str, fn: Callable[[], None]) -> Callable[[], None]:
+    def _page() -> None:
+        _enter(name)
+        fn()
+
+    return _page
+
+
+def _keep_widget_state() -> None:
+    """Streamlit يحذف حالة الأدوات غير المعروضة عند مغادرة الصفحة؛ نعيد تثبيتها كقيم عادية."""
+    ss = st.session_state
+    skip = ("_", "gpa_table", "tasks_ed_", "lec_file", "rd_files", "plan_pdf", "tasks_up")
+    for k in list(ss.keys()):
+        if isinstance(k, str) and not k.startswith(skip):
+            try:
+                ss[k] = ss[k]
+            except Exception:  # أزرار وعناصر لا تقبل الإسناد
+                pass
+
+
+PAGE_SPECS = [  # (المعرّف = مسار الرابط، الدالة، العنوان، الأيقونة)
+    ("gpa", "tab_gpa", "حاسبة المعدل", "🧮"), ("plan", "tab_plan", "الخطة والجدول الإرشادي", "🗓️"),
+    ("files", "tab_lecture", "تحليل الملفات", "📚"), ("pomodoro", "tab_pomodoro", "مؤقت بومودورو", "⏱️"),
+    ("code", "tab_code", "حلّال البرمجة", "💻"), ("radar", "tab_radar", "رادار الامتحانات", "🎯"),
+    ("tasks", "tab_tasks", "الواجبات", "📅"), ("arena", "tab_arena", "ساحة التحدي", "🏆"),
+    ("support", "tab_support", "الدعم المعنوي", "💚"), ("export", "tab_export", "التصدير", "📤"),
+]
+
+
+def page_home() -> None:
+    ss = st.session_state
     st.markdown(
         '<div class="hero"><div class="eyebrow">AI-POWERED STUDY PLATFORM · JUST</div>'
         '<h1>حوّل محاضراتك إلى <span>خطة تفوّق</span></h1>'
@@ -1697,13 +2517,65 @@ def main() -> None:
     stat_grid([("بطاقات الحفظ", len(lec.get("flashcards", []))), ("أسئلة التدريب", len(lec.get("quiz", []))),
                ("واجبات قيد التنفيذ", due), ("آخر معدل تراكمي", str(gpa) if gpa is not None else "—")])
 
-    if st.query_params.get("arena"):
-        st.info("🏆 وصلك رابط تحدٍّ — افتح تبويب «التحدي» ثم «انضم لتحدٍّ».")
+    if st.query_params.get("arena") and "arena" in _PAGES:
+        st.info("🏆 وصلك رابط تحدٍّ")
+        st.page_link(_PAGES["arena"], label="افتح ساحة التحدي", icon="🏆")
+    st.markdown("#### 🧭 اختر صفحة")
+    for row in range(0, len(PAGE_SPECS), 2):
+        cols = st.columns(2)
+        for col, (name, _fn, title, icon) in zip(cols, PAGE_SPECS[row:row + 2]):
+            if name in _PAGES:
+                with col:
+                    st.page_link(_PAGES[name], label=title, icon=icon)
 
-    names = ["📚 المحاضرات", "💻 البرمجة", "🎯 الرادار", "🧮 المعدل", "🗓️ الخطة", "📅 الواجبات", "🏆 التحدي", "💚 الدعم", "📤 التصدير"]
-    for tab, fn in zip(st.tabs(names), (tab_lecture, tab_code, tab_radar, tab_gpa, tab_plan, tab_tasks, tab_arena, tab_support, tab_export)):
-        with tab:
-            fn()
+
+def main() -> None:
+    ss = st.session_state
+    ss.setdefault("dark", False)
+
+    with st.sidebar:
+        st.markdown("### ◈ SlideMind AI")
+        account_sidebar()
+        st.markdown("---")
+        ss.dark = st.toggle("🌙 الوضع الداكن", value=ss.dark, key="dark_toggle")
+        st.markdown("---")
+        env_pref = os.getenv("AI_PROVIDER", "auto")
+        st.selectbox("🔌 مزوّد الذكاء الاصطناعي", list(PROVIDER_LABELS), format_func=PROVIDER_LABELS.get,
+                     index=list(PROVIDER_LABELS).index(env_pref) if env_pref in PROVIDER_LABELS else 0, key="provider_pref")
+        with st.expander("🔑 مفاتيحي الخاصة (اختياري)"):
+            st.caption("تُحفظ في ذاكرة جلستك فقط ولا تُكتب على القرص.")
+            st.text_input("Gemini API Key", type="password", key="user_GEMINI_API_KEY")
+            st.text_input("Groq API Key", type="password", key="user_GROQ_API_KEY")
+        has_g, has_q = bool(get_key("GEMINI_API_KEY")), bool(get_key("GROQ_API_KEY"))
+        st.markdown(f"{'✅' if has_g else '⚪'} Gemini · {'✅' if has_q else '⚪'} Groq")
+        plan = provider_plan()
+        if plan:
+            st.caption("الترتيب: " + " ← ".join(m for _, m in plan))
+        else:
+            st.markdown("⚠️ لا يوجد مفتاح للمزوّد المختار؛ ستعمل النتائج المحلية المبسطة فقط.")
+        if st.button("🧹 مسح الذاكرة المؤقتة", key="clear_cache"):
+            st.cache_data.clear()
+            _DEAD_MODELS.clear()
+            st.toast("تم مسح الكاش")
+        if st.button("↺ بدء جلسة جديدة", key="reset_session"):
+            for k in list(ss.keys()):
+                del ss[k]
+            st.rerun()
+        st.markdown("---")
+        st.caption("🔒 الملفات تُعالج في الذاكرة فقط ولا تُحفظ على القرص. النتائج للمراجعة وتحتاج تحقق الطالب.")
+
+    inject_css(bool(ss.dark))
+    support_popover()
+
+    pages = [st.Page(page_home, title="الرئيسية", icon="🏠", default=True)]
+    _PAGES["home"] = pages[0]
+    for name, fn_name, title, icon in PAGE_SPECS:
+        pg = st.Page(_make_page(name, globals()[fn_name]), title=title, icon=icon, url_path=name)
+        _PAGES[name] = pg
+        pages.append(pg)
+    _keep_widget_state()
+    st.navigation(pages).run()
+    autosave()
 
 
 if __name__ == "__main__":
