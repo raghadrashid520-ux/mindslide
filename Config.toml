@@ -1,5 +1,6 @@
 [theme]
-base = "light"         
+base = "light"          # يمنع تعارض ألوان التطبيق مع الوضع الداكن للهاتف؛ الوضع الداكن يُفعَّل من داخل التطبيق
+
 [server]
 maxUploadSize = 20
 enableXsrfProtection = true
